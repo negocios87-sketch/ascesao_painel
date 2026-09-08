@@ -691,9 +691,11 @@ TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "Renovacao_IC")
 # Casa por trecho do nome, então "Negocia" pega "Negociação" em qualquer funil.
 ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia")
 
-# Metas por frente e por mês (tabela de projeção Set–Dez/26)
+# Metas por frente e por mês.
+# Set/26 revisado para 500k: os 40k a mais entraram no Navigator (300k -> 340k),
+# batendo com a meta da Denise na planilha METAS.
 METAS_FRENTES = {
-    (2026,  9): {"navigator": 300000, "mgm": 120000, "renovacao": 40000},
+    (2026,  9): {"navigator": 340000, "mgm": 120000, "renovacao": 40000},
     (2026, 10): {"navigator": 313600, "mgm": 127300, "renovacao": 47300},
     (2026, 11): {"navigator": 327300, "mgm": 134500, "renovacao": 54500},
     (2026, 12): {"navigator": 340900, "mgm": 141800, "renovacao": 61800},
