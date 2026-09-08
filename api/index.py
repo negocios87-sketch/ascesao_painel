@@ -54,6 +54,24 @@ URL_FERIADOS = os.environ.get("URL_FERIADOS", "https://docs.google.com/spreadshe
 
 EXCLUIR_PESSOAS = {"priscila ribeiro"}
 
+# Rótulo exibido no painel (só cosmético — o funil buscado continua sendo FUNIL_NOME)
+ROTULO_FUNIL = os.environ.get("ROTULO_FUNIL", "ASCENSÃO/MGM")
+
+# Quem aparece em cada tabela. Nomes separados por vírgula, como estão no Pipedrive.
+CLOSERS_LISTA = os.environ.get("CLOSERS", "Denise Mussolin,Mylena Oliveira")
+SDRS_LISTA    = os.environ.get("SDRS",    "Raphaela Moutinho")
+# Só as pendências deste dono aparecem na seção "Pipe a arrumar" (vazio = todos)
+PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin")
+
+# Usados só no cálculo de SDR (mesmos filtros e campo do painel gerente_comercial)
+FILTER_ACTIVITIES = int(os.environ.get("FILTER_ACTIVITIES", "1310451"))
+FILTER_DEALS_RV   = int(os.environ.get("FILTER_DEALS_RV",   "1431880"))
+CF_QUALIFICADOR   = "a6f13cc27c8d041f3af4091283ce0d4fe0913875"
+
+
+def _lista_norm(raw):
+    return [norm(x) for x in raw.split(",") if x.strip()]
+
 
 def _subareas():
     raw = os.environ.get("SUBAREAS_META", "ascensao")
@@ -380,6 +398,162 @@ def buscar_abertos(pipeline_id):
     return cached(f"abertos:{pipeline_id}", 120, _fetch)
 
 
+
+def buscar_qual_ids():
+    """Mapa nome_normalizado -> id da opção no campo Qualificador."""
+    def _fetch():
+        r = req.get(f"{BASE_V1}/dealFields", params={"api_token": API_KEY}, timeout=25)
+        r.raise_for_status()
+        for field in (r.json().get("data") or []):
+            if field.get("key") == CF_QUALIFICADOR:
+                return {norm(o.get("label", "")): str(o.get("id"))
+                        for o in (field.get("options") or [])}
+        return {}
+    return cached("qual_ids", 900, _fetch)
+
+
+def buscar_activities_mes(mes, ano):
+    """Atividades do filtro de reuniões, com due_date dentro do mês."""
+    def _fetch():
+        mes_str = f"{ano}-{mes:02d}"
+        todos, cursor = [], None
+        while True:
+            params = {"filter_id": FILTER_ACTIVITIES, "limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+            r = req.get(f"{BASE_V2}/activities", params=params,
+                        headers={"x-api-token": API_KEY}, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            lote = data.get("data") or []
+            todos += [a for a in lote
+                      if str(a.get("due_date", "") or "")[:7] == mes_str]
+            cursor = (data.get("additional_data") or {}).get("next_cursor")
+            if not cursor or not lote:
+                break
+        return todos
+    return cached(f"acts:{ano}-{mes}", 300, _fetch)
+
+
+def buscar_deals_rv():
+    """Deals do filtro de Reunião Validada: ids válidos + mapa deal -> owner."""
+    def _fetch():
+        ids, mapa, start = set(), {}, 0
+        while True:
+            r = req.get(f"{BASE_V1}/deals", params={
+                "filter_id": FILTER_DEALS_RV, "status": "all_not_deleted",
+                "limit": 500, "start": start, "api_token": API_KEY,
+            }, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            lote = data.get("data") or []
+            for d in lote:
+                ids.add(d["id"])
+                uid = d.get("user_id")
+                mapa[d["id"]] = uid.get("id") if isinstance(uid, dict) else uid
+            mais = (data.get("additional_data", {})
+                        .get("pagination", {})
+                        .get("more_items_in_collection", False))
+            if not mais or not lote:
+                break
+            start += 500
+        return ids, mapa
+    return cached("deals_rv", 300, _fetch)
+
+
+def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
+    """
+    Métricas de SDR, mesma régua do painel gerente_comercial:
+      validadas     = atividade concluída, cujo responsável != dono do deal,
+                      e cujo deal está no filtro de Reunião Validada
+      deveria_estar = meta_reu / DU total x DU passados
+      pct_ganhos    = valor com multiplicador / meta financeira
+      pct_final     = pct_reu x PESO_REU + pct_ganhos x PESO_FIN  (70/30 desde mai/2026)
+
+    O financeiro sai dos ganhos DESTE funil — o painel é do funil, não da pessoa.
+    """
+    alvo = _lista_norm(SDRS_LISTA)
+    if not alvo:
+        return []
+
+    if (ano > 2026) or (ano == 2026 and mes >= 5):
+        PESO_REU, PESO_FIN = 0.70, 0.30
+    else:
+        PESO_REU, PESO_FIN = 0.50, 0.50
+
+    acts = buscar_activities_mes(mes, ano)
+    ids_rv, mapa_deal_owner = buscar_deals_rv()
+    qual_ids = buscar_qual_ids()
+
+    # os ganhos do mês também entram no mapa deal -> owner
+    for d in ganhos:
+        if d["id"] not in mapa_deal_owner:
+            uid = d.get("user_id")
+            mapa_deal_owner[d["id"]] = uid.get("id") if isinstance(uid, dict) else uid
+
+    nome_por_uid = {uid: nome for uid, nome in users.items()}
+    uid_por_nome = {norm(nome): uid for uid, nome in users.items()}
+    metas_por_nome = {m["nome_norm"]: m for m in metas}
+
+    acts_por_owner = {}
+    for a in acts:
+        acts_por_owner.setdefault(str(a.get("owner_id", "")), []).append(a)
+
+    def valida(a):
+        if not (a.get("done") is True or a.get("status") == "done"):
+            return False
+        deal_id = a.get("deal_id")
+        dono_act = str(a.get("owner_id", ""))
+        dono_deal = str(mapa_deal_owner.get(deal_id, "")) if deal_id else ""
+        if dono_act and dono_deal and dono_act == dono_deal:
+            return False
+        if deal_id and deal_id not in ids_rv:
+            return False
+        return True
+
+    out = []
+    for nn in alvo:
+        uid = uid_por_nome.get(nn)
+        nome = nome_por_uid.get(uid, nn.title())
+        m = metas_por_nome.get(nn, {})
+        meta_reu = m.get("meta_reu", 0.0)
+        meta_fin = m.get("meta_fin", 0.0)
+
+        validadas = len([a for a in acts_por_owner.get(str(uid), []) if valida(a)])
+        deveria = arred(safe_div(meta_reu, du_total) * du_pass)
+        pct_reu = arred(safe_div(validadas, meta_reu) * 100) if meta_reu else None
+
+        qid = qual_ids.get(nn)
+        deals_sdr = [d for d in ganhos
+                     if qid and str(cf(d, CF_QUALIFICADOR)) == str(qid)]
+        valor_bruto = sum(float(d.get("value") or 0) for d in deals_sdr)
+        valor_multi = sum(float(cf(d, CF_MULTIPLICADOR) or 0) for d in deals_sdr)
+        pct_ganhos = arred(safe_div(valor_multi, meta_fin) * 100) if meta_fin else None
+
+        pct_final = (arred((pct_reu or 0) * PESO_REU + (pct_ganhos or 0) * PESO_FIN)
+                     if (meta_reu or meta_fin) else None)
+
+        out.append({
+            "nome": nome,
+            "encontrado_no_pipedrive": uid is not None,
+            "meta_reuniao": arred(meta_reu),
+            "meta_diaria": arred(safe_div(meta_reu, du_total)),
+            "validadas": validadas,
+            "deveria_estar": deveria,
+            "faltam": arred(deveria - validadas),
+            "pct_reu": pct_reu,
+            "meta_ganho": arred(meta_fin),
+            "qtd_ganhos": len(deals_sdr),
+            "valor_ganho": arred(valor_bruto),
+            "valor_ganho_multi": arred(valor_multi),
+            "pct_ganhos": pct_ganhos,
+            "ticket_medio": arred(safe_div(valor_bruto, len(deals_sdr))) if deals_sdr else 0.0,
+            "pct_final": pct_final,
+            "pesos": f"{int(PESO_REU*100)}/{int(PESO_FIN*100)}",
+        })
+    return out
+
+
 # ── CÁLCULO ───────────────────────────────────────────────────
 def bucket_dia(deals_abertos, dia_str):
     """Separa os abertos de um dia nos buckets 20/50/70 e calcula previsto/em aberto."""
@@ -419,7 +593,7 @@ MOTIVOS = {
 }
 
 
-def montar_pendencias(abertos, users):
+def montar_pendencias(abertos, users, so_do_dono=""):
     """
     Deals ABERTOS do funil com informacao faltando - e a lista que a gestora usa
     para arrumar o pipe no Pipedrive. Tres problemas, em ordem de gravidade:
@@ -428,8 +602,11 @@ def montar_pendencias(abertos, users):
       2. sem_probabilidade -> entra em "Em Aberto", fica fora do "Previsto"
       3. prob_fora         -> idem; a regua do painel so pondera 20/50/70
     """
+    dono_alvo = norm(so_do_dono)
     itens = []
     for d in abertos:
+        if dono_alvo and norm(owner_name(d, users)) != dono_alvo:
+            continue
         dt = str(d.get("expected_close_date") or "")[:10]
         pr = d.get("probability")
 
@@ -457,6 +634,9 @@ def montar_pendencias(abertos, users):
     ordem = {"sem_data": 0, "sem_probabilidade": 1, "prob_fora": 2}
     itens.sort(key=lambda x: (ordem[x["motivo"]], -x["valor"]))
 
+    considerados = [d for d in abertos
+                    if not dono_alvo or norm(owner_name(d, users)) == dono_alvo]
+
     resumo = {}
     for k, label in MOTIVOS.items():
         sel = [i for i in itens if i["motivo"] == k]
@@ -468,8 +648,9 @@ def montar_pendencias(abertos, users):
         "resumo": resumo,
         "qtd_total": len(itens),
         "valor_total": arred(sum(i["valor"] for i in itens)),
-        "qtd_abertos": len(abertos),
-        "valor_abertos": arred(sum(float(d.get("value") or 0) for d in abertos)),
+        "qtd_abertos": len(considerados),
+        "valor_abertos": arred(sum(float(d.get("value") or 0) for d in considerados)),
+        "filtrado_por": so_do_dono or None,
     }
 
 
@@ -619,16 +800,28 @@ def calcular_navigator(mes=None, ano=None):
             "aberto_hoje": arred(v["aberto_hoje"]),
             "previsto_hoje": arred(v["previsto_hoje"]),
         })
+    lista_closers = _lista_norm(CLOSERS_LISTA)
+    if lista_closers:
+        closers = [c for c in closers if norm(c["nome"]) in lista_closers]
     closers.sort(key=lambda x: -x["real_multi"])
 
+    # ── SDRs (régua do painel gerente_comercial) ──────────────
+    sdrs, erro_sdr = [], None
+    try:
+        sdrs = calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass)
+    except Exception as e:
+        erro_sdr = f"{type(e).__name__}: {e}"
+
     # ── Pendências do pipe + alertas ──────────────────────────
-    pend = montar_pendencias(abertos, users)
+    pend = montar_pendencias(abertos, users, so_do_dono=PENDENCIAS_DONO)
 
     alertas = []
     if not closers_meta and not META_FIXA:
         alertas.append(
             "Nenhum closer com Subarea = " + "/".join(sorted(subareas))
             + " e meta financeira no METAS — a Meta Mês veio zerada.")
+    if erro_sdr:
+        alertas.append("Não consegui calcular as métricas de SDR agora — " + erro_sdr)
     for chave in ("sem_data", "sem_probabilidade", "prob_fora"):
         r = pend["resumo"][chave]
         if r["qtd"]:
@@ -637,6 +830,7 @@ def calcular_navigator(mes=None, ano=None):
 
     return {
         "funil": pipe["nome"],
+        "rotulo": ROTULO_FUNIL,
         "pipeline_id": pid,
         "periodo": {
             "mes": mes, "ano": ano,
@@ -646,6 +840,7 @@ def calcular_navigator(mes=None, ano=None):
         },
         "metricas": metricas,
         "closers": closers,
+        "sdrs": sdrs,
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
         "meta_composicao": sorted(closers_meta, key=lambda x: -x["meta"]),
@@ -737,7 +932,7 @@ PAGINA_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Navigator — Board Academy</title>
+<title>Ascensão/MGM — Board Academy</title>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   :root{
@@ -833,6 +1028,8 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .rodape{text-align:right;color:var(--muted);font-size:11px;font-style:italic;margin-top:14px}
 
 
+  .peso-nota{font-size:10px;font-weight:600;color:var(--muted);text-transform:none;letter-spacing:0}
+
   /* PIPE A ARRUMAR */
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
   .chip{border-radius:6px;padding:7px 12px;font-size:12px;border:1px solid;background:var(--white)}
@@ -874,7 +1071,7 @@ PAGINA_HTML = r"""<!DOCTYPE html>
       <div class="brand-bar"></div>
       <div>
         <div class="brand-text">BOARD ACADEMY</div>
-        <div class="brand-sub">Funil Navigator · Closers</div>
+        <div class="brand-sub" id="brand-sub">Ascensão/MGM · Closers e SDR</div>
       </div>
     </div>
     <div class="periodo-badge" id="periodo-badge">Carregando…</div>
@@ -951,7 +1148,7 @@ function render(d){
     <div class="table-scroll">
       <table class="kpi">
         <thead>
-          <tr><th>Métrica</th><th class="val">${(d.funil || 'NAVIGATOR').toUpperCase()}</th></tr>
+          <tr><th>Métrica</th><th class="val">${(d.rotulo || d.funil || '').toUpperCase()}</th></tr>
         </thead>
         <tbody>
           ${linha('Meta Mês',                 money(m.meta_mes,{forcar:1}), 'destaque')}
@@ -960,13 +1157,13 @@ function render(d){
           ${linha('Realizado Multiplicador',  money(m.real_multi))}
           ${linha('Deveria (100%) — MTD',     `${money(m.deveria_mtd,{forcar:1})} <span class="hint">${devHint}</span>`, 'sep')}
           ${linha('Atingimento',              pctTag(m.atingimento), 'destaque', 'c/ multiplicador')}
-          ${linha('Gap 100%',                 `<span class="${gapCls}">${R(m.gap_100)}</span>`)}
-          ${linha('Meta/Dia 100%',            money(m.meta_dia_100,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
-          ${linha('Meta/Dia 100% (Bruto)',    money(m.meta_dia_100_bruto,{forcar:1}))}
+          ${linha('Gap 100%',                 `<span class="${gapCls}">${R(m.gap_100)}</span>`, '', 'c/ multiplicador')}
+          ${linha('Meta/Dia 100% (c/ Multiplicador)', money(m.meta_dia_100,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
+          ${linha('Meta/Dia 100% (Bruto)',            money(m.meta_dia_100_bruto,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
 
-          ${linha(`Previsto Ontem <span class="hint">${p.ontem}</span>`, money(m.previsto_ontem), 'sep g-ontem')}
-          ${linha('Entrou Ontem (Multiplicador)', money(m.entrou_ontem_multi), 'g-ontem')}
-          ${linha('Entrou Ontem (Bruto)',         money(m.entrou_ontem_bruto), 'g-ontem')}
+          ${linha(`Previsto Último DU <span class="hint">${p.ontem}</span>`, money(m.previsto_ontem), 'sep g-ontem')}
+          ${linha('Entrou Último DU (Multiplicador)', money(m.entrou_ontem_multi), 'g-ontem')}
+          ${linha('Entrou Último DU (Bruto)',      money(m.entrou_ontem_bruto), 'g-ontem')}
 
           ${linha(`Previsto Hoje <span class="hint">${p.hoje}</span>`, money(m.previsto_hoje), 'sep g-hoje')}
           ${linha('Em Aberto Hoje',               money(m.em_aberto_hoje), 'g-hoje')}
@@ -1031,6 +1228,47 @@ function render(d){
   }
 
 
+  // ── SDRs ──
+  let sdrHtml = '';
+  if ((d.sdrs || []).length) {
+    const linhas = d.sdrs.map(s => `
+      <tr>
+        <td>${esc(s.nome)}${s.encontrado_no_pipedrive ? '' : ' <span class="tag tag-sem_data">não achei no Pipedrive</span>'}</td>
+        <td>${s.meta_reuniao > 0 ? N(s.meta_reuniao) : '<span class="zero">—</span>'}</td>
+        <td>${s.meta_diaria > 0 ? s.meta_diaria.toFixed(1).replace('.',',') : '<span class="zero">—</span>'}</td>
+        <td><b>${N(s.validadas)}</b></td>
+        <td>${s.deveria_estar > 0 ? Math.round(s.deveria_estar) : '<span class="zero">—</span>'}</td>
+        <td>${s.meta_reuniao > 0 ? (s.faltam <= 0
+              ? `<span class="pos">+${N(Math.abs(Math.round(s.faltam)))}</span>`
+              : `<span class="neg">${N(Math.round(s.faltam))}</span>`) : '<span class="zero">—</span>'}</td>
+        <td>${pctTag(s.pct_reu)}</td>
+        <td>${s.meta_ganho > 0 ? R(s.meta_ganho) : '<span class="zero">—</span>'}</td>
+        <td>${N(s.qtd_ganhos)}</td>
+        <td>${money(s.valor_ganho)}</td>
+        <td>${money(s.valor_ganho_multi)}</td>
+        <td>${pctTag(s.pct_ganhos)}</td>
+        <td>${pctTag(s.pct_final)}</td>
+      </tr>`).join('');
+    const pesos = d.sdrs[0].pesos || '70/30';
+    sdrHtml = `
+      <div class="block-title">Por SDR<div class="rule"></div>
+        <span class="peso-nota">% Final = % Reunião x ${pesos.split('/')[0]}% + % Ganhos x ${pesos.split('/')[1]}%</span>
+      </div>
+      <div class="card">
+        <div class="table-scroll">
+          <table class="closers">
+            <thead><tr>
+              <th>SDR</th><th>Meta Reu.</th><th>Meta/Dia</th><th>Validadas</th>
+              <th>Deveria Estar</th><th>Faltam</th><th>% Reu.</th>
+              <th>Meta Ganho</th><th>Qtd</th><th>R$ Ganho</th><th>R$ c/ Multi</th>
+              <th>% Ganhos</th><th>% Final</th>
+            </tr></thead>
+            <tbody>${linhas}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
   // ── pipe a arrumar ──
   let pendHtml = '';
   const pend = d.pendencias;
@@ -1060,7 +1298,7 @@ function render(d){
       : '';
 
     pendHtml = `
-      <div class="block-title">Pipe a arrumar<div class="rule"></div></div>
+      <div class="block-title">Pipe a arrumar${pend.filtrado_por ? ` — ${esc(pend.filtrado_por)}` : ''}<div class="rule"></div></div>
       ${chips ? `<div class="chips">${chips}</div>` : ''}
       <div class="card">
         ${pend.qtd_total ? `
@@ -1086,7 +1324,7 @@ function render(d){
     : '';
 
   document.getElementById('conteudo').innerHTML =
-    `<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${pendHtml}${alertas}${comp}
+    `<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${sdrHtml}${pendHtml}${alertas}${comp}
      <div class="rodape">Funil ${d.funil} (pipeline ${d.pipeline_id}) · atualizado em ${p.atualizado_em}</div>`;
 }
 
