@@ -62,6 +62,8 @@ CLOSERS_LISTA = os.environ.get("CLOSERS", "Denise Mussolin,Mylena Oliveira")
 SDRS_LISTA    = os.environ.get("SDRS",    "Raphaela Moutinho")
 # Só as pendências deste dono aparecem na seção "Pipe a arrumar" (vazio = todos)
 PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin")
+# Responsáveis ignorados na contagem E no detalhamento de reuniões
+EXCLUIR_REU = os.environ.get("EXCLUIR_REU", "Denise Mussolin")
 
 # Usados só no cálculo de SDR (mesmos filtros e campo do painel gerente_comercial)
 FILTER_ACTIVITIES = int(os.environ.get("FILTER_ACTIVITIES", "1310451"))
@@ -399,6 +401,15 @@ def buscar_abertos(pipeline_id):
 
 
 
+def buscar_pipelines_mapa():
+    """Mapa pipeline_id -> nome do funil."""
+    def _fetch():
+        r = req.get(f"{BASE_V1}/pipelines", params={"api_token": API_KEY}, timeout=20)
+        r.raise_for_status()
+        return {p["id"]: p.get("name", "") for p in (r.json().get("data") or [])}
+    return cached("pipes_mapa", 3600, _fetch)
+
+
 def buscar_qual_ids():
     """Mapa nome_normalizado -> id da opção no campo Qualificador."""
     def _fetch():
@@ -450,7 +461,11 @@ def buscar_deals_rv():
             for d in lote:
                 ids.add(d["id"])
                 uid = d.get("user_id")
-                mapa[d["id"]] = uid.get("id") if isinstance(uid, dict) else uid
+                mapa[d["id"]] = {
+                    "owner": uid.get("id") if isinstance(uid, dict) else uid,
+                    "pipeline_id": d.get("pipeline_id"),
+                    "titulo": d.get("title", ""),
+                }
             mais = (data.get("additional_data", {})
                         .get("pagination", {})
                         .get("more_items_in_collection", False))
@@ -489,7 +504,11 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
     for d in ganhos:
         if d["id"] not in mapa_deal_owner:
             uid = d.get("user_id")
-            mapa_deal_owner[d["id"]] = uid.get("id") if isinstance(uid, dict) else uid
+            mapa_deal_owner[d["id"]] = {
+                "owner": uid.get("id") if isinstance(uid, dict) else uid,
+                "pipeline_id": d.get("pipeline_id"),
+                "titulo": d.get("title", ""),
+            }
 
     nome_por_uid = {uid: nome for uid, nome in users.items()}
     uid_por_nome = {norm(nome): uid for uid, nome in users.items()}
@@ -504,7 +523,7 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
             return False
         deal_id = a.get("deal_id")
         dono_act = str(a.get("owner_id", ""))
-        dono_deal = str(mapa_deal_owner.get(deal_id, "")) if deal_id else ""
+        dono_deal = str((mapa_deal_owner.get(deal_id) or {}).get("owner", "")) if deal_id else ""
         if dono_act and dono_deal and dono_act == dono_deal:
             return False
         if deal_id and deal_id not in ids_rv:
@@ -695,41 +714,86 @@ def eh_renovacao(deal):
     return norm(str(val)) == alvo or str(val) == str(TAG_RENOVACAO_VALOR)
 
 
-def contar_reunioes(mes, ano, users, dias):
+def contar_reunioes(mes, ano, users, dias, deals_extra=None):
     """
-    Reuniões por dia, das pessoas da equipe (closers + SDRs).
-      previstas  = atividades do filtro de reuniões com due_date naquele dia
-      realizadas = as concluídas, cujo responsável != dono do deal e cujo deal
-                   está no filtro de Reunião Validada (mesma régua do gerente_comercial)
+    Reuniões por dia, das pessoas da equipe (closers + SDRs), com o detalhamento.
+
+      agendadas  = atividades do filtro de reuniões com due_date naquele dia
+      realizadas = concluídas, com responsável != dono do deal e deal dentro do
+                   filtro de Reunião Validada (mesma régua do gerente_comercial)
+
+    Quem estiver em EXCLUIR_REU não entra nem na contagem nem na lista.
+    Cada linha do detalhe traz o status para explicar por que entrou ou não:
+      realizada        → done e validada (é o que o card conta)
+      nao_validada     → done, mas fora do filtro RV ou responsável = dono do deal
+      pendente         → ainda não concluída
     """
     equipe = set(_lista_norm(CLOSERS_LISTA)) | set(_lista_norm(SDRS_LISTA))
-    uids = {str(uid) for uid, nome in users.items() if norm(nome) in equipe}
-    out = {d: {"previstas": 0, "realizadas": 0} for d in dias}
+    excluidos = set(_lista_norm(EXCLUIR_REU))
+    uids = {str(uid): nome for uid, nome in users.items()
+            if norm(nome) in equipe and norm(nome) not in excluidos}
+
+    contagem = {d: {"agendadas": 0, "realizadas": 0} for d in dias}
+    detalhe = {d: [] for d in dias}
     if not uids:
-        return out
+        return {"contagem": contagem, "detalhe": detalhe}
 
     acts = buscar_activities_mes(mes, ano)
-    ids_rv, mapa_dono = buscar_deals_rv()
+    ids_rv, mapa_deal = buscar_deals_rv()
+    pipes = buscar_pipelines_mapa()
+
+    # deals que já temos em mãos completam o mapa (funil e título)
+    for d in (deals_extra or []):
+        mapa_deal.setdefault(d.get("id"), {
+            "owner": (d.get("user_id") or {}).get("id") if isinstance(d.get("user_id"), dict)
+                     else d.get("owner_id") if not isinstance(d.get("owner_id"), dict)
+                     else (d.get("owner_id") or {}).get("id"),
+            "pipeline_id": d.get("pipeline_id"),
+            "titulo": d.get("title", ""),
+        })
 
     for a in acts:
         dono_act = str(a.get("owner_id", ""))
         if dono_act not in uids:
             continue
         dia = str(a.get("due_date", "") or "")[:10]
-        if dia not in out:
+        if dia not in contagem:
             continue
-        out[dia]["previstas"] += 1
 
-        if not (a.get("done") is True or a.get("status") == "done"):
-            continue
         deal_id = a.get("deal_id")
-        dono_deal = str(mapa_dono.get(deal_id, "")) if deal_id else ""
-        if dono_act and dono_deal and dono_act == dono_deal:
-            continue
-        if deal_id and deal_id not in ids_rv:
-            continue
-        out[dia]["realizadas"] += 1
-    return out
+        info = mapa_deal.get(deal_id) or {}
+        dono_deal = str(info.get("owner", "")) if deal_id else ""
+        concluida = a.get("done") is True or a.get("status") == "done"
+
+        if not concluida:
+            status = "pendente"
+        elif dono_act and dono_deal and dono_act == dono_deal:
+            status = "nao_validada"
+        elif deal_id and deal_id not in ids_rv:
+            status = "nao_validada"
+        else:
+            status = "realizada"
+
+        contagem[dia]["agendadas"] += 1
+        if status == "realizada":
+            contagem[dia]["realizadas"] += 1
+
+        hora = str(a.get("due_time", "") or "")[:5]
+        detalhe[dia].append({
+            "responsavel": uids[dono_act],
+            "hora": hora or None,
+            "funil": pipes.get(info.get("pipeline_id")) or None,
+            "assunto": a.get("subject") or "(sem assunto)",
+            "deal": info.get("titulo") or None,
+            "deal_url": f"https://boardacademy.pipedrive.com/deal/{deal_id}" if deal_id else None,
+            "status": status,
+        })
+
+    ordem = {"realizada": 0, "nao_validada": 1, "pendente": 2}
+    for dia in detalhe:
+        detalhe[dia].sort(key=lambda x: (x["hora"] or "99:99", ordem[x["status"]]))
+
+    return {"contagem": contagem, "detalhe": detalhe}
 
 
 def calcular_navigator(mes=None, ano=None):
@@ -915,9 +979,10 @@ def calcular_navigator(mes=None, ano=None):
         erro_sdr = f"{type(e).__name__}: {e}"
 
     # ── Reuniões de hoje e do último DU ───────────────────────
-    reunioes, erro_reu = {}, None
+    reunioes, erro_reu = {"contagem": {}, "detalhe": {}}, None
     try:
-        reunioes = contar_reunioes(mes, ano, users, [ontem_str, hoje_str])
+        reunioes = contar_reunioes(mes, ano, users, [ontem_str, hoje_str],
+                                   deals_extra=ganhos + abertos)
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
 
@@ -958,8 +1023,11 @@ def calcular_navigator(mes=None, ano=None):
         "closers": closers,
         "sdrs": sdrs,
         "reunioes": {
-            "hoje":  reunioes.get(hoje_str,  {"previstas": 0, "realizadas": 0}),
-            "ontem": reunioes.get(ontem_str, {"previstas": 0, "realizadas": 0}),
+            "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0}),
+            "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0}),
+            "lista_hoje":  (reunioes.get("detalhe") or {}).get(hoje_str, []),
+            "lista_ontem": (reunioes.get("detalhe") or {}).get(ontem_str, []),
+            "excluidos": EXCLUIR_REU,
         },
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
@@ -1335,12 +1403,6 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .frentes tr.total td:first-child{color:var(--gold)}
   .frentes tr.zerada td:first-child{color:var(--muted)}
   .frentes tr.zerada td{color:var(--muted)}
-  .proj td, .proj th{padding:9px 14px;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
-  .proj th{background:var(--navy);color:rgba(255,255,255,.7);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
-  .proj th:first-child, .proj td:first-child{text-align:left}
-  .proj tbody tr{border-bottom:1px solid #EFF1F4}
-  .proj tr.mes-atual td{background:var(--amber-bg);font-weight:700}
-  .proj tr.soma td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:22px}
   .kcard{background:var(--white);border:1px solid var(--border);border-left:3px solid var(--gold);
          border-radius:8px;padding:14px 16px;box-shadow:var(--shadow)}
@@ -1349,6 +1411,34 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard .sub{font-size:11px;color:var(--muted);margin-top:3px}
   .kcard.hoje{border-left-color:#1E3A8A;background:var(--blue-bg)}
   .kcard.ontem{border-left-color:var(--muted)}
+
+  .btn-det{float:right;background:transparent;border:1px solid var(--border);border-radius:4px;
+           color:var(--muted);font-size:9px;font-weight:700;padding:2px 7px;cursor:pointer;
+           text-transform:uppercase;letter-spacing:.4px;transition:all .15s}
+  .btn-det:hover{border-color:var(--gold);color:var(--gold)}
+  .det-box{background:var(--white);border:1px solid var(--border);border-radius:8px;
+           box-shadow:var(--shadow);margin-bottom:22px;overflow:hidden}
+  .det-head{background:var(--navy);padding:9px 16px;display:flex;align-items:center;
+            justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .det-head .t{color:var(--gold);font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}
+  .det-head .x{background:transparent;border:1px solid rgba(255,255,255,.25);border-radius:4px;
+               color:rgba(255,255,255,.65);font-size:10px;padding:3px 9px;cursor:pointer}
+  .det-head .x:hover{border-color:var(--gold);color:var(--gold)}
+  .det table{width:100%;border-collapse:collapse;font-size:12px}
+  .det th{background:#F7F8FA;color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.5px;
+          text-transform:uppercase;padding:8px 14px;text-align:left;border-bottom:1px solid var(--border)}
+  .det td{padding:9px 14px;border-bottom:1px solid #EFF1F4;vertical-align:middle}
+  .det tr:hover{background:#F8F9FF}
+  .det .hora{font-variant-numeric:tabular-nums;font-weight:700;color:var(--navy);white-space:nowrap}
+  .det a{color:var(--navy);text-decoration:none;font-weight:600}
+  .det a:hover{text-decoration:underline}
+  .st{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;
+      border:1px solid;white-space:nowrap}
+  .st-realizada{background:#ECFDF5;color:var(--green);border-color:#A7D8BE}
+  .st-nao_validada{background:var(--amber-bg);color:var(--amber);border-color:#F0D9A8}
+  .st-pendente{background:var(--blue-bg);color:#1E3A8A;border-color:#C9D4E8}
+  .det-vazio{padding:22px;text-align:center;color:var(--muted);font-size:12px}
+  .det-nota{padding:10px 16px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);line-height:1.6}
 
   .nota-comp{font-size:11px;color:var(--muted);padding:9px 4px 0;line-height:1.6}
   .nota-comp b{color:var(--navy)}
@@ -1472,6 +1562,7 @@ function linha(rotulo, valorHtml, cls='', hint=''){
 }
 
 function render(d){
+  dadosPainel = d;
   const p = d.periodo, m = d.metricas;
 
   document.getElementById('periodo-badge').innerHTML =
@@ -1486,9 +1577,10 @@ function render(d){
   const respostas = `
     <div class="cards">
       <div class="kcard ontem">
-        <div class="rot">Reuniões — Último DU</div>
+        <div class="rot">Reuniões — Último DU
+          <button class="btn-det" onclick="verReunioes('ontem')">Detalhamento</button></div>
         <div class="val">${N(reu.ontem.realizadas || 0)}</div>
-        <div class="sub">realizadas de ${N(reu.ontem.previstas || 0)} agendadas · ${p.ontem}</div>
+        <div class="sub">validadas de ${N(reu.ontem.agendadas || 0)} agendadas · ${p.ontem}</div>
       </div>
       <div class="kcard ontem">
         <div class="rot">Vendas — Último DU</div>
@@ -1496,9 +1588,10 @@ function render(d){
         <div class="sub">c/ multiplicador · bruto ${R(m.entrou_ontem_bruto)}</div>
       </div>
       <div class="kcard hoje">
-        <div class="rot">Reuniões — Hoje</div>
-        <div class="val">${N(reu.hoje.previstas || 0)}</div>
-        <div class="sub">agendadas · ${N(reu.hoje.realizadas || 0)} já realizadas</div>
+        <div class="rot">Reuniões — Hoje
+          <button class="btn-det" onclick="verReunioes('hoje')">Detalhamento</button></div>
+        <div class="val">${N(reu.hoje.agendadas || 0)}</div>
+        <div class="sub">agendadas · ${N(reu.hoje.realizadas || 0)} já validadas</div>
       </div>
       <div class="kcard hoje">
         <div class="rot">Vendas — Hoje</div>
@@ -1506,6 +1599,7 @@ function render(d){
         <div class="sub">c/ multiplicador · bruto ${R(m.entrou_hoje_bruto)}</div>
       </div>
     </div>
+    <div id="det-reunioes"></div>
     <div class="cards">
       <div class="kcard hoje"><div class="rot">Pipe 70% — Hoje</div>
         <div class="val">${R(dh.p70 || 0)}</div><div class="sub">pondera ${R((dh.p70||0)*0.7)}</div></div>
@@ -1554,8 +1648,8 @@ function render(d){
           ${linha('&nbsp;&nbsp;· Pipe 70%',        money(dh.p70), 'g-hoje')}
           ${linha('&nbsp;&nbsp;· Pipe 50%',        money(dh.p50), 'g-hoje')}
           ${linha('&nbsp;&nbsp;· Pipe 20%',        money(dh.p20), 'g-hoje')}
-          ${linha('Reuniões Hoje (agendadas)',     N(reu.hoje.previstas || 0), 'g-hoje')}
-          ${linha('Reuniões Último DU (realizadas)', N(reu.ontem.realizadas || 0), 'g-ontem')}
+          ${linha('Reuniões Hoje (agendadas)',     N(reu.hoje.agendadas || 0), 'g-hoje')}
+          ${linha('Reuniões Último DU (validadas)',  N(reu.ontem.realizadas || 0), 'g-ontem')}
           ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
           ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
 
@@ -1746,6 +1840,50 @@ async function carregar(){
   }
 }
 
+// ── DETALHAMENTO DE REUNIÕES ──────────────────────────────────
+let dadosPainel = null;
+const ST_LABEL = {realizada:'Validada', nao_validada:'Não validada', pendente:'Pendente'};
+
+function verReunioes(qual){
+  const box = document.getElementById('det-reunioes');
+  if (!box || !dadosPainel) return;
+  if (box.dataset.aberto === qual) { box.innerHTML = ''; box.dataset.aberto = ''; return; }
+  box.dataset.aberto = qual;
+
+  const r = dadosPainel.reunioes || {};
+  const itens = qual === 'hoje' ? (r.lista_hoje || []) : (r.lista_ontem || []);
+  const dia = qual === 'hoje' ? dadosPainel.periodo.hoje : dadosPainel.periodo.ontem;
+  const rot = qual === 'hoje' ? 'Hoje' : 'Último dia útil';
+
+  const linhas = itens.map(i => `
+    <tr>
+      <td class="hora">${i.hora || '—'}</td>
+      <td>${esc(i.responsavel)}</td>
+      <td>${i.funil ? esc(i.funil) : '<span class="zero">—</span>'}</td>
+      <td>${i.deal_url ? `<a href="${i.deal_url}" target="_blank" rel="noopener">${esc(i.deal || i.assunto)} ↗</a>` : esc(i.assunto)}</td>
+      <td><span class="st st-${i.status}">${ST_LABEL[i.status]}</span></td>
+    </tr>`).join('');
+
+  box.innerHTML = `
+    <div class="det-box det">
+      <div class="det-head">
+        <span class="t">Reuniões — ${rot} · ${dia} · ${itens.length} registro(s)</span>
+        <button class="x" onclick="verReunioes('${qual}')">fechar</button>
+      </div>
+      ${itens.length ? `
+        <table>
+          <thead><tr><th>Hora</th><th>Responsável</th><th>Funil</th><th>Negócio</th><th>Status</th></tr></thead>
+          <tbody>${linhas}</tbody>
+        </table>` : '<div class="det-vazio">Nenhuma reunião registrada nesse dia.</div>'}
+      <div class="det-nota">
+        <b>Validada</b> = concluída, com responsável diferente do dono do negócio e dentro do filtro de Reunião Validada — é o número que o card conta.
+        <b>Não validada</b> = concluída, mas reprovada em uma dessas duas regras.
+        <b>Pendente</b> = ainda não marcada como concluída.
+        ${r.excluidos ? `Reuniões com <b>${esc(r.excluidos)}</b> como responsável ficam de fora.` : ''}
+      </div>
+    </div>`;
+}
+
 // ── ABAS ──────────────────────────────────────────────────────
 let resumoCarregado = false;
 function setView(v){
@@ -1775,14 +1913,6 @@ function renderResumo(d){
       <td>${money(f.previsto_hoje)}</td>
     </tr>`;
 
-  const proj = d.projecao.map(x => `
-    <tr class="${x.atual ? 'mes-atual' : ''}">
-      <td>${x.rotulo}${x.atual ? ' ◀' : ''}</td>
-      <td>${R(x.navigator)}</td><td>${R(x.mgm)}</td><td>${R(x.renovacao)}</td>
-      <td><b>${R(x.total)}</b></td>
-    </tr>`).join('');
-  const somaProj = d.projecao.reduce((a,x) => ({
-    n:a.n+x.navigator, m:a.m+x.mgm, r:a.r+x.renovacao, t:a.t+x.total}), {n:0,m:0,r:0,t:0});
 
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
 
@@ -1813,17 +1943,6 @@ function renderResumo(d){
       </table>
     </div></div>
 
-    <div class="block-title">Projeção Set–Dez/26<div class="rule"></div></div>
-    <div class="card"><div class="table-scroll">
-      <table class="proj">
-        <thead><tr><th>Mês</th><th>Ascensão (Navigator)</th><th>Novos Negócios (MGM)</th>
-          <th>Renovação</th><th>Total</th></tr></thead>
-        <tbody>${proj}
-          <tr class="soma"><td>TOTAL</td><td>${R(somaProj.n)}</td><td>${R(somaProj.m)}</td>
-            <td>${R(somaProj.r)}</td><td>${R(somaProj.t)}</td></tr>
-        </tbody>
-      </table>
-    </div></div>
     ${alertas}
     <div class="rodape">Atualizado em ${p.atualizado_em} · ${p.du_passados}/${p.du_total} dias úteis</div>`;
 }
