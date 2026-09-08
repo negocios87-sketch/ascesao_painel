@@ -606,12 +606,13 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
 
 
 # ── CÁLCULO ───────────────────────────────────────────────────
-def bucket_dia(deals_abertos, dia_str):
-    """Separa os abertos de um dia nos buckets 20/50/70 e calcula previsto/em aberto."""
+def bucket_dias(deals_abertos, dias):
+    """Buckets 20/50/70 dos abertos cuja data prevista cai em `dias` (set ou lista)."""
+    alvo = {dias} if isinstance(dias, str) else set(dias)
     p20 = p50 = p70 = outros = sem_prob = 0.0
     qtd = 0
     for d in deals_abertos:
-        if str(d.get("expected_close_date") or "")[:10] != dia_str:
+        if str(d.get("expected_close_date") or "")[:10] not in alvo:
             continue
         v = float(d.get("value") or 0)
         qtd += 1
@@ -633,6 +634,11 @@ def bucket_dia(deals_abertos, dia_str):
         "em_aberto": arred(p20 + p50 + p70 + outros + sem_prob),
         "qtd": qtd,
     }
+
+
+def bucket_dia(deals_abertos, dia_str):
+    """Atalho para um único dia."""
+    return bucket_dias(deals_abertos, dia_str)
 
 
 PROBS_VALIDAS = (20, 50, 70)
@@ -1013,8 +1019,23 @@ def calcular_navigator(mes=None, ano=None):
     dia_ontem = ultimo_du(hoje, feriados)
     ontem_str = dia_ontem.strftime("%Y-%m-%d")
 
+    # Semana corrente: domingo -> sábado (a tabela mostra a semana; os cards, o dia)
+    dias_desde_dom = (hoje.weekday() + 1) % 7
+    dom = hoje - timedelta(days=dias_desde_dom)
+    sab = dom + timedelta(days=6)
+    dias_semana = [(dom + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
     b_hoje = bucket_dia(abertos, hoje_str)
     b_ontem = bucket_dia(abertos, ontem_str)
+    b_semana = bucket_dias(abertos, dias_semana)
+    g_semana = {"bruto": 0.0, "multi": 0.0, "qtd": 0}
+    for d in dias_semana:
+        acc = por_dia.get(d)
+        if acc:
+            g_semana["bruto"] += acc["bruto"]
+            g_semana["multi"] += acc["multi"]
+            g_semana["qtd"] += acc["qtd"]
+
     g_hoje = por_dia.get(hoje_str, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
     g_ontem = por_dia.get(ontem_str, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
 
@@ -1101,7 +1122,8 @@ def calcular_navigator(mes=None, ano=None):
     # ── Reuniões de hoje e do último DU ───────────────────────
     reunioes, erro_reu = {"contagem": {}, "detalhe": {}}, None
     try:
-        reunioes = contar_reunioes(mes, ano, users, [ontem_str, hoje_str],
+        dias_reu = sorted({ontem_str, hoje_str} | set(dias_semana))
+        reunioes = contar_reunioes(mes, ano, users, dias_reu,
                                    deals_extra=ganhos + abertos)
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
@@ -1151,6 +1173,22 @@ def calcular_navigator(mes=None, ano=None):
             "lista_hoje":  (reunioes.get("detalhe") or {}).get(hoje_str, []),
             "lista_ontem": (reunioes.get("detalhe") or {}).get(ontem_str, []),
             "excluidos": EXCLUIR_REU,
+        },
+        "semana": {
+            "ini": dom.strftime("%Y-%m-%d"),
+            "fim": sab.strftime("%Y-%m-%d"),
+            "p20": b_semana["p20"], "p50": b_semana["p50"], "p70": b_semana["p70"],
+            "previsto": b_semana["previsto"], "em_aberto": b_semana["em_aberto"],
+            "qtd_abertos": b_semana["qtd"],
+            "entrou_bruto": arred(g_semana["bruto"]),
+            "entrou_multi": arred(g_semana["multi"]),
+            "qtd_vendas": g_semana["qtd"],
+            "reunioes_agendadas": sum(
+                ((reunioes.get("contagem") or {}).get(d) or {}).get("agendadas", 0)
+                for d in dias_semana),
+            "reunioes_validadas": sum(
+                ((reunioes.get("contagem") or {}).get(d) or {}).get("realizadas", 0)
+                for d in dias_semana),
         },
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
@@ -1657,6 +1695,7 @@ const KEY = new URLSearchParams(location.search).get('k') || '';
 
 const R = v => 'R$ ' + Number(v||0).toLocaleString('pt-BR',{maximumFractionDigits:0});
 const N = v => Number(v||0).toLocaleString('pt-BR');
+const fmtDia = s => s ? s.slice(8,10) + '/' + s.slice(5,7) : '';
 const P = v => v == null ? '—' : Number(v).toFixed(1).replace('.',',') + '%';
 const esc = s => String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1706,6 +1745,7 @@ function render(d){
   const reu = d.reunioes || {hoje:{}, ontem:{}};
   const dh = d.detalhe_hoje || {};
   const cFunis = d.composicao || {};
+  const sem = d.semana || {};
   const respostas = `
     <div class="cards">
       <div class="kcard ontem">
@@ -1733,16 +1773,16 @@ function render(d){
     </div>
     <div id="det-reunioes"></div>
     <div class="cards">
-      <div class="kcard hoje"><div class="rot">Pipe 70% — Negociação</div>
+      <div class="kcard hoje"><div class="rot">Pipe 70% — Hoje</div>
         <div class="val">${R(dh.p70 || 0)}</div><div class="sub">pondera ${R((dh.p70||0)*0.7)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 50% — Negociação</div>
+      <div class="kcard hoje"><div class="rot">Pipe 50% — Hoje</div>
         <div class="val">${R(dh.p50 || 0)}</div><div class="sub">pondera ${R((dh.p50||0)*0.5)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 20% — Negociação</div>
+      <div class="kcard hoje"><div class="rot">Pipe 20% — Hoje</div>
         <div class="val">${R(dh.p20 || 0)}</div><div class="sub">pondera ${R((dh.p20||0)*0.2)}</div></div>
       <div class="kcard"><div class="rot">Previsto Hoje</div>
         <div class="val">${R(m.previsto_hoje)}</div>
         <div class="sub">de ${R(m.em_aberto_hoje)} em aberto (${dh.qtd || 0} negócios)${
-          cFunis.etapa_previsao ? ` · só etapa ${esc(cFunis.etapa_previsao)}` : ''}</div></div>
+          cFunis.etapa_previsao ? ` · só negócios em Negociação` : ''}</div></div>
     </div>`;
 
   const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
@@ -1773,17 +1813,16 @@ function render(d){
           ${linha('Meta/Dia 100% (c/ Multiplicador)', money(m.meta_dia_100,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
           ${linha('Meta/Dia 100% (Bruto)',            money(m.meta_dia_100_bruto,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
 
-          ${linha(`Previsto Último DU <span class="hint">${p.ontem}</span>`, money(m.previsto_ontem), 'sep g-ontem')}
-          ${linha('Entrou Último DU (Multiplicador)', money(m.entrou_ontem_multi), 'g-ontem')}
-          ${linha('Entrou Último DU (Bruto)',      money(m.entrou_ontem_bruto), 'g-ontem')}
-
-          ${linha(`Previsto Hoje <span class="hint">${p.hoje}</span>`, money(m.previsto_hoje), 'sep g-hoje')}
-          ${linha('Em Aberto Hoje',               money(m.em_aberto_hoje), 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 70%',        money(dh.p70), 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 50%',        money(dh.p50), 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 20%',        money(dh.p20), 'g-hoje')}
-          ${linha('Reuniões Hoje (agendadas)',     N(reu.hoje.agendadas || 0), 'g-hoje')}
-          ${linha('Reuniões Último DU (validadas)',  N(reu.ontem.realizadas || 0), 'g-ontem')}
+          ${linha(`<b>Semana</b> <span class="hint">${sem.ini ? fmtDia(sem.ini) + ' a ' + fmtDia(sem.fim) : ''}</span>`, '', 'sep g-hoje destaque')}
+          ${linha('Entrou na Semana (Multiplicador)', money(sem.entrou_multi), 'g-hoje')}
+          ${linha('Entrou na Semana (Bruto)',         money(sem.entrou_bruto), 'g-hoje')}
+          ${linha('Vendas na Semana',                 N(sem.qtd_vendas || 0), 'g-hoje')}
+          ${linha('Previsto da Semana',               money(sem.previsto), 'g-hoje')}
+          ${linha('Em Aberto na Semana',              `${money(sem.em_aberto)} <span class="hint">${N(sem.qtd_abertos || 0)} negócio(s)</span>`, 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 70%',           money(sem.p70), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 50%',           money(sem.p50), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 20%',           money(sem.p20), 'g-hoje')}
+          ${linha('Reuniões na Semana',               `${N(sem.reunioes_validadas || 0)} <span class="hint">validadas de ${N(sem.reunioes_agendadas || 0)} agendadas</span>`, 'g-hoje')}
           ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
           ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
 
