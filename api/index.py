@@ -683,8 +683,13 @@ PIPELINE_MGM = int(os.environ.get("PIPELINE_MGM", "92"))
 # Enquanto a tag não for configurada, Renovação fica zerada e o Navigator vem inteiro.
 # TAG_RENOVACAO_CAMPO = a chave (hash) do campo personalizado no Pipedrive
 # TAG_RENOVACAO_VALOR = o valor/label que identifica renovação
-TAG_RENOVACAO_CAMPO = os.environ.get("TAG_RENOVACAO_CAMPO", "")
-TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "")
+TAG_RENOVACAO_CAMPO = os.environ.get(
+    "TAG_RENOVACAO_CAMPO", "54fc9258843cdf7ea126b6c5aca9d4dc93a3a718")
+TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "Renovacao_IC")
+
+# Só negócios nesta etapa entram na previsão (20/50/70) e no pipe do dia.
+# Casa por trecho do nome, então "Negocia" pega "Negociação" em qualquer funil.
+ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia")
 
 # Metas por frente e por mês (tabela de projeção Set–Dez/26)
 METAS_FRENTES = {
@@ -701,17 +706,73 @@ NOMES_FRENTES = {
 }
 
 
+def valores_tag_renovacao():
+    """
+    Aceita tanto o label ("Renovacao_IC") quanto o id da opção — campos de seleção
+    do Pipedrive devolvem o id, não o texto. Resolve os dois via /dealFields.
+    """
+    def _fetch():
+        aceitos = {norm(TAG_RENOVACAO_VALOR), str(TAG_RENOVACAO_VALOR).strip()}
+        try:
+            r = req.get(f"{BASE_V1}/dealFields", params={"api_token": API_KEY}, timeout=25)
+            r.raise_for_status()
+            for field in (r.json().get("data") or []):
+                if field.get("key") != TAG_RENOVACAO_CAMPO:
+                    continue
+                for o in (field.get("options") or []):
+                    if norm(o.get("label", "")) == norm(TAG_RENOVACAO_VALOR):
+                        aceitos.add(str(o.get("id")))
+        except Exception:
+            pass
+        return {a for a in aceitos if a}
+    return cached("tag_renov", 900, _fetch)
+
+
 def eh_renovacao(deal):
-    """True se o deal carrega a tag de Renovação. Sem tag configurada, sempre False."""
+    """True se o negócio carrega a tag de Renovação."""
     if not TAG_RENOVACAO_CAMPO or not TAG_RENOVACAO_VALOR:
         return False
     val = cf(deal, TAG_RENOVACAO_CAMPO)
     if val is None:
         return False
-    alvo = norm(TAG_RENOVACAO_VALOR)
+    aceitos = valores_tag_renovacao()
+
+    def bate(v):
+        if isinstance(v, dict):
+            return (str(v.get("id")) in aceitos
+                    or norm(str(v.get("label", ""))) in aceitos)
+        return str(v).strip() in aceitos or norm(str(v)) in aceitos
+
     if isinstance(val, list):
-        return any(norm(str(v)) == alvo for v in val)
-    return norm(str(val)) == alvo or str(val) == str(TAG_RENOVACAO_VALOR)
+        return any(bate(v) for v in val)
+    return bate(val)
+
+
+def buscar_stages_mapa():
+    """Mapa stage_id -> nome da etapa."""
+    def _fetch():
+        r = req.get(f"{BASE_V1}/stages", params={"api_token": API_KEY, "limit": 500},
+                    timeout=20)
+        r.raise_for_status()
+        return {s["id"]: s.get("name", "") for s in (r.json().get("data") or [])}
+    return cached("stages", 3600, _fetch)
+
+
+def stages_previsao():
+    """Ids das etapas que contam para a previsão. None = filtro desligado."""
+    alvo = norm(ETAPA_PREVISAO)
+    if not alvo:
+        return None
+    ids = {sid for sid, nome in buscar_stages_mapa().items() if alvo in norm(nome)}
+    return ids or None          # nenhuma etapa casou: não filtra nada
+
+
+def so_em_negociacao(deals):
+    """Filtra para as etapas de previsão. Devolve (lista, filtrou?)."""
+    ids = stages_previsao()
+    if ids is None:
+        return list(deals), False
+    return [d for d in deals if d.get("stage_id") in ids], True
 
 
 def contar_reunioes(mes, ano, users, dias, deals_extra=None):
@@ -719,6 +780,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
     Reuniões por dia, das pessoas da equipe (closers + SDRs), com o detalhamento.
 
       agendadas  = atividades do filtro de reuniões com due_date naquele dia
+                   E com um negócio vinculado (sem deal_id, não conta)
       realizadas = concluídas, com responsável != dono do deal e deal dentro do
                    filtro de Reunião Validada (mesma régua do gerente_comercial)
 
@@ -761,6 +823,8 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
             continue
 
         deal_id = a.get("deal_id")
+        if not deal_id:            # sem negócio vinculado, não conta
+            continue
         info = mapa_deal.get(deal_id) or {}
         dono_deal = str(info.get("owner", "")) if deal_id else ""
         concluida = a.get("done") is True or a.get("status") == "done"
@@ -864,9 +928,14 @@ def calcular_navigator(mes=None, ano=None):
             erro_mgm = f"{type(e).__name__}: {e}"
 
     ganhos = ganhos_nav + ganhos_mgm
-    abertos = abertos_nav + abertos_mgm
+    abertos_todos = abertos_nav + abertos_mgm
+    # A previsão (20/50/70) e o pipe do dia só consideram a etapa de Negociação
+    abertos, filtrou_etapa = so_em_negociacao(abertos_todos)
 
     composicao = {
+        "etapa_previsao": ETAPA_PREVISAO if filtrou_etapa else None,
+        "abertos_negociacao": len(abertos),
+        "abertos_total": len(abertos_todos),
         "navigator": {"qtd": len(ganhos_nav),
                       "valor": arred(sum(float(d.get("value") or 0) for d in ganhos_nav)),
                       "abertos": len(abertos_nav)},
@@ -994,6 +1063,9 @@ def calcular_navigator(mes=None, ano=None):
         alertas.append(
             "Nenhum closer com Subarea = " + "/".join(sorted(subareas))
             + " e meta financeira no METAS — a Meta Mês veio zerada.")
+    if not filtrou_etapa and ETAPA_PREVISAO:
+        alertas.append(f"Nenhuma etapa com \"{ETAPA_PREVISAO}\" no nome foi encontrada — "
+                       "a previsão está considerando todas as etapas.")
     if erro_mgm:
         alertas.append("Não consegui ler o funil MGM agora, os números estão só com o "
                        "Navigator — " + erro_mgm)
@@ -1087,15 +1159,19 @@ def calcular_resumo(mes=None, ano=None):
         erro_mgm = f"{type(e).__name__}: {e}"
 
     tag_ativa = bool(TAG_RENOVACAO_CAMPO and TAG_RENOVACAO_VALOR)
+    # o pipe considerado é só o da etapa de Negociação
+    abertos_nav_neg, filtrou_etapa = so_em_negociacao(abertos_nav)
+    abertos_mgm_neg, _ = so_em_negociacao(abertos_mgm)
+
     grupos = {
         "navigator": {
             "ganhos":  [d for d in ganhos_nav if not eh_renovacao(d)],
-            "abertos": [d for d in abertos_nav if not eh_renovacao(d)],
+            "abertos": [d for d in abertos_nav_neg if not eh_renovacao(d)],
         },
-        "mgm": {"ganhos": ganhos_mgm, "abertos": abertos_mgm},
+        "mgm": {"ganhos": ganhos_mgm, "abertos": abertos_mgm_neg},
         "renovacao": {
             "ganhos":  [d for d in ganhos_nav if eh_renovacao(d)],
-            "abertos": [d for d in abertos_nav if eh_renovacao(d)],
+            "abertos": [d for d in abertos_nav_neg if eh_renovacao(d)],
         },
     }
 
@@ -1170,6 +1246,9 @@ def calcular_resumo(mes=None, ano=None):
                        if c["nome_norm"] == m["nome_norm"]), "")) in _subareas())
 
     alertas = []
+    if not filtrou_etapa and ETAPA_PREVISAO:
+        alertas.append(f"Nenhuma etapa com \"{ETAPA_PREVISAO}\" no nome foi encontrada — "
+                       "o pipe está considerando todas as etapas.")
     if not tag_ativa:
         alertas.append("A tag de Renovação ainda não foi configurada — a frente aparece zerada "
                        "e o Navigator está vindo inteiro. Preencha TAG_RENOVACAO_CAMPO e "
@@ -1196,6 +1275,7 @@ def calcular_resumo(mes=None, ano=None):
         "projecao": projecao,
         "meta_planilha": arred(meta_planilha),
         "tag_renovacao_ativa": tag_ativa,
+        "etapa_previsao": ETAPA_PREVISAO if filtrou_etapa else None,
         "alertas": alertas,
     }
 
@@ -1601,15 +1681,16 @@ function render(d){
     </div>
     <div id="det-reunioes"></div>
     <div class="cards">
-      <div class="kcard hoje"><div class="rot">Pipe 70% — Hoje</div>
+      <div class="kcard hoje"><div class="rot">Pipe 70% — Negociação</div>
         <div class="val">${R(dh.p70 || 0)}</div><div class="sub">pondera ${R((dh.p70||0)*0.7)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 50% — Hoje</div>
+      <div class="kcard hoje"><div class="rot">Pipe 50% — Negociação</div>
         <div class="val">${R(dh.p50 || 0)}</div><div class="sub">pondera ${R((dh.p50||0)*0.5)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 20% — Hoje</div>
+      <div class="kcard hoje"><div class="rot">Pipe 20% — Negociação</div>
         <div class="val">${R(dh.p20 || 0)}</div><div class="sub">pondera ${R((dh.p20||0)*0.2)}</div></div>
       <div class="kcard"><div class="rot">Previsto Hoje</div>
         <div class="val">${R(m.previsto_hoje)}</div>
-        <div class="sub">de ${R(m.em_aberto_hoje)} em aberto (${dh.qtd || 0} negócios)</div></div>
+        <div class="sub">de ${R(m.em_aberto_hoje)} em aberto (${dh.qtd || 0} negócios)${
+          cFunis.etapa_previsao ? ` · só etapa ${esc(cFunis.etapa_previsao)}` : ''}</div></div>
     </div>`;
 
   const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
@@ -1619,7 +1700,9 @@ function render(d){
   const notaComp = d.consolidado ? `
     <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
       ${R(cFunis.navigator?.valor || 0)} &nbsp;+&nbsp; <b>MGM</b> ${N(cFunis.mgm?.qtd || 0)} venda(s) ·
-      ${R(cFunis.mgm?.valor || 0)}. A separação por frente fica na aba Resumo.</div>` : '';
+      ${R(cFunis.mgm?.valor || 0)}. A separação por frente fica na aba Resumo.${
+        cFunis.etapa_previsao ? ` A previsão do dia considera só os ${N(cFunis.abertos_negociacao || 0)} negócios
+        na etapa <b>${esc(cFunis.etapa_previsao)}</b>, de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
 
   const kpi = `
   <div class="card">
@@ -1928,13 +2011,15 @@ function renderResumo(d){
         <div class="sub">nos ${p.du_restantes} DU restantes</div></div>
     </div>
 
-    <div class="block-title">Por frente — ${MESES[p.mes-1]} ${p.ano}<div class="rule"></div></div>
+    <div class="block-title">Por frente — ${MESES[p.mes-1]} ${p.ano}<div class="rule"></div>
+      ${d.etapa_previsao ? `<span class="peso-nota">pipe e previsto: só etapa ${esc(d.etapa_previsao)}</span>` : ''}
+    </div>
     <div class="card"><div class="table-scroll">
       <table class="frentes">
         <thead><tr>
           <th>Frente</th><th>Meta</th><th>Deveria (MTD)</th><th>Bruto</th><th>Multiplicador</th>
           <th>% Ating.</th><th>Gap</th><th>Falta/Dia</th><th>Vol.</th>
-          <th>Pipe Aberto</th><th>Previsto Hoje</th>
+          <th>Pipe em Negociação</th><th>Previsto Hoje</th>
         </tr></thead>
         <tbody>
           ${d.frentes.map(f => linhaFrente(f)).join('')}
