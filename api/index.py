@@ -1817,11 +1817,11 @@ function render(d){
           ${linha('Entrou na Semana (Multiplicador)', money(sem.entrou_multi), 'g-hoje')}
           ${linha('Entrou na Semana (Bruto)',         money(sem.entrou_bruto), 'g-hoje')}
           ${linha('Vendas na Semana',                 N(sem.qtd_vendas || 0), 'g-hoje')}
-          ${linha('Previsto da Semana',               money(sem.previsto), 'g-hoje')}
+          ${linha('Previsto da Semana',               money(sem.previsto), 'g-hoje', 'soma dos ponderados abaixo')}
           ${linha('Em Aberto na Semana',              `${money(sem.em_aberto)} <span class="hint">${N(sem.qtd_abertos || 0)} negócio(s)</span>`, 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 70%',           money(sem.p70), 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 50%',           money(sem.p50), 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 20%',           money(sem.p20), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 70%', `${money(sem.p70)} <span class="hint">pondera ${R((sem.p70||0)*0.7)}</span>`, 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 50%', `${money(sem.p50)} <span class="hint">pondera ${R((sem.p50||0)*0.5)}</span>`, 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 20%', `${money(sem.p20)} <span class="hint">pondera ${R((sem.p20||0)*0.2)}</span>`, 'g-hoje')}
           ${linha('Reuniões na Semana',               `${N(sem.reunioes_validadas || 0)} <span class="hint">validadas de ${N(sem.reunioes_agendadas || 0)} agendadas</span>`, 'g-hoje')}
           ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
           ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
