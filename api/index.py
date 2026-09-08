@@ -1654,6 +1654,7 @@ function render(d){
   // ── respostas rápidas: ontem e hoje ──
   const reu = d.reunioes || {hoje:{}, ontem:{}};
   const dh = d.detalhe_hoje || {};
+  const cFunis = d.composicao || {};
   const respostas = `
     <div class="cards">
       <div class="kcard ontem">
@@ -1696,7 +1697,6 @@ function render(d){
   const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
   const devHint  = `(${P(m.pct_mes_decorrido)} do mês)`;
 
-  const cFunis = d.composicao || {};
   const notaComp = d.consolidado ? `
     <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
       ${R(cFunis.navigator?.valor || 0)} &nbsp;+&nbsp; <b>MGM</b> ${N(cFunis.mgm?.qtd || 0)} venda(s) ·
