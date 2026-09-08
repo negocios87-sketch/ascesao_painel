@@ -781,8 +781,9 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
     """
     Reuniões por dia, das pessoas da equipe (closers + SDRs), com o detalhamento.
 
-      agendadas  = atividades do filtro de reuniões com due_date naquele dia
-                   E com um negócio vinculado (sem deal_id, não conta)
+      agendadas  = atividades do filtro de reuniões com due_date naquele dia,
+                   com negócio vinculado, deduplicadas por negócio (mesmo dia +
+                   mesmo negócio = uma reunião só)
       realizadas = concluídas, com responsável != dono do deal e deal dentro do
                    filtro de Reunião Validada (mesma régua do gerente_comercial)
 
@@ -840,12 +841,9 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
         else:
             status = "realizada"
 
-        contagem[dia]["agendadas"] += 1
-        if status == "realizada":
-            contagem[dia]["realizadas"] += 1
-
         hora = str(a.get("due_time", "") or "")[:5]
         detalhe[dia].append({
+            "deal_id": deal_id,
             "responsavel": uids[dono_act],
             "hora": hora or None,
             "funil": pipes.get(info.get("pipeline_id")) or None,
@@ -855,9 +853,29 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
             "status": status,
         })
 
+    # ── dedup: mesmo dia + mesmo negócio = uma reunião só ─────
+    # É comum a atividade estar duplicada no CRM. Quando acontece, fica a de
+    # melhor status (uma validada não some por causa de uma pendente repetida)
+    # e, no empate, a de horário mais cedo.
     ordem = {"realizada": 0, "nao_validada": 1, "pendente": 2}
-    for dia in detalhe:
-        detalhe[dia].sort(key=lambda x: (x["hora"] or "99:99", ordem[x["status"]]))
+    duplicadas = {}
+    for dia, itens in detalhe.items():
+        melhor = {}
+        for it in itens:
+            chave = it["deal_id"]
+            atual = melhor.get(chave)
+            if atual is None or ((ordem[it["status"]], it["hora"] or "99:99")
+                                 < (ordem[atual["status"]], atual["hora"] or "99:99")):
+                melhor[chave] = it
+        duplicadas[dia] = len(itens) - len(melhor)
+        lista = sorted(melhor.values(),
+                       key=lambda x: (x["hora"] or "99:99", ordem[x["status"]]))
+        detalhe[dia] = lista
+        contagem[dia] = {
+            "agendadas": len(lista),
+            "realizadas": sum(1 for i in lista if i["status"] == "realizada"),
+            "duplicadas_ocultas": duplicadas[dia],
+        }
 
     return {"contagem": contagem, "detalhe": detalhe}
 
@@ -1097,8 +1115,8 @@ def calcular_navigator(mes=None, ano=None):
         "closers": closers,
         "sdrs": sdrs,
         "reunioes": {
-            "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0}),
-            "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0}),
+            "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
+            "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
             "lista_hoje":  (reunioes.get("detalhe") or {}).get(hoje_str, []),
             "lista_ontem": (reunioes.get("detalhe") or {}).get(ontem_str, []),
             "excluidos": EXCLUIR_REU,
@@ -1938,6 +1956,7 @@ function verReunioes(qual){
   const r = dadosPainel.reunioes || {};
   const itens = qual === 'hoje' ? (r.lista_hoje || []) : (r.lista_ontem || []);
   const dia = qual === 'hoje' ? dadosPainel.periodo.hoje : dadosPainel.periodo.ontem;
+  const dup = (qual === 'hoje' ? r.hoje : r.ontem)?.duplicadas_ocultas || 0;
   const rot = qual === 'hoje' ? 'Hoje' : 'Último dia útil';
 
   const linhas = itens.map(i => `
@@ -1965,6 +1984,7 @@ function verReunioes(qual){
         <b>Não validada</b> = concluída, mas reprovada em uma dessas duas regras.
         <b>Pendente</b> = ainda não marcada como concluída.
         ${r.excluidos ? `Reuniões com <b>${esc(r.excluidos)}</b> como responsável ficam de fora.` : ''}
+        ${dup > 0 ? `<br><b>${dup}</b> atividade(s) duplicada(s) no mesmo negócio foram ocultadas — no Pipedrive existe mais de uma para o mesmo negócio neste dia.` : ''}
       </div>
     </div>`;
 }
