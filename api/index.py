@@ -24,7 +24,7 @@ Variáveis de ambiente:
   META_FIXA      (opcional)     sobrescreve a meta somada da planilha
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 import requests as req
 import os
 import io
@@ -410,6 +410,69 @@ def bucket_dia(deals_abertos, dia_str):
     }
 
 
+PROBS_VALIDAS = (20, 50, 70)
+
+MOTIVOS = {
+    "sem_data":          "Sem data prevista de fechamento",
+    "sem_probabilidade": "Sem probabilidade preenchida",
+    "prob_fora":         "Probabilidade fora de 20/50/70",
+}
+
+
+def montar_pendencias(abertos, users):
+    """
+    Deals ABERTOS do funil com informacao faltando - e a lista que a gestora usa
+    para arrumar o pipe no Pipedrive. Tres problemas, em ordem de gravidade:
+
+      1. sem_data          -> o deal nao aparece em NENHUM dia do painel
+      2. sem_probabilidade -> entra em "Em Aberto", fica fora do "Previsto"
+      3. prob_fora         -> idem; a regua do painel so pondera 20/50/70
+    """
+    itens = []
+    for d in abertos:
+        dt = str(d.get("expected_close_date") or "")[:10]
+        pr = d.get("probability")
+
+        if not dt:
+            motivo = "sem_data"
+        elif pr is None:
+            motivo = "sem_probabilidade"
+        elif pr not in PROBS_VALIDAS:
+            motivo = "prob_fora"
+        else:
+            continue
+
+        itens.append({
+            "id": d.get("id"),
+            "titulo": d.get("title") or "(sem titulo)",
+            "dono": owner_name(d, users) or "- sem dono -",
+            "valor": arred(float(d.get("value") or 0)),
+            "probabilidade": pr,
+            "prev_fechamento": dt or None,
+            "motivo": motivo,
+            "motivo_label": MOTIVOS[motivo],
+            "url": f"https://boardacademy.pipedrive.com/deal/{d.get('id')}",
+        })
+
+    ordem = {"sem_data": 0, "sem_probabilidade": 1, "prob_fora": 2}
+    itens.sort(key=lambda x: (ordem[x["motivo"]], -x["valor"]))
+
+    resumo = {}
+    for k, label in MOTIVOS.items():
+        sel = [i for i in itens if i["motivo"] == k]
+        resumo[k] = {"label": label, "qtd": len(sel),
+                     "valor": arred(sum(i["valor"] for i in sel))}
+
+    return {
+        "itens": itens,
+        "resumo": resumo,
+        "qtd_total": len(itens),
+        "valor_total": arred(sum(i["valor"] for i in itens)),
+        "qtd_abertos": len(abertos),
+        "valor_abertos": arred(sum(float(d.get("value") or 0) for d in abertos)),
+    }
+
+
 def calcular_navigator(mes=None, ano=None):
     hoje = hoje_br()
     mes = mes or hoje.month
@@ -558,23 +621,19 @@ def calcular_navigator(mes=None, ano=None):
         })
     closers.sort(key=lambda x: -x["real_multi"])
 
-    # ── Diagnóstico (aparece no rodapé só se houver ruído) ────
+    # ── Pendências do pipe + alertas ──────────────────────────
+    pend = montar_pendencias(abertos, users)
+
     alertas = []
     if not closers_meta and not META_FIXA:
         alertas.append(
-            "Nenhum closer com Subarea = "
-            + "/".join(sorted(subareas))
+            "Nenhum closer com Subarea = " + "/".join(sorted(subareas))
             + " e meta financeira no METAS — a Meta Mês veio zerada.")
-    if b_hoje["fora_bucket"] > 0 or b_ontem["fora_bucket"] > 0:
-        alertas.append(
-            f"R$ {b_hoje['fora_bucket'] + b_ontem['fora_bucket']:,.0f} em deals abertos com "
-            "probabilidade fora de 20/50/70 — entram em 'Em Aberto' mas não no 'Previsto'."
-            .replace(",", "."))
-    if b_hoje["sem_probabilidade"] > 0 or b_ontem["sem_probabilidade"] > 0:
-        alertas.append(
-            f"R$ {b_hoje['sem_probabilidade'] + b_ontem['sem_probabilidade']:,.0f} em deals abertos "
-            "SEM probabilidade preenchida — não entram no 'Previsto'."
-            .replace(",", "."))
+    for chave in ("sem_data", "sem_probabilidade", "prob_fora"):
+        r = pend["resumo"][chave]
+        if r["qtd"]:
+            valor_fmt = f"{r['valor']:,.0f}".replace(",", ".")
+            alertas.append(f"{r['qtd']} deal(s) · R$ {valor_fmt} — {r['label']}.")
 
     return {
         "funil": pipe["nome"],
@@ -590,6 +649,7 @@ def calcular_navigator(mes=None, ano=None):
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
         "meta_composicao": sorted(closers_meta, key=lambda x: -x["meta"]),
+        "pendencias": pend,
         "alertas": alertas,
     }
 
@@ -626,18 +686,22 @@ def _handler():
 @app.route("/<path:p>", methods=["GET"])
 def roteador(p):
     """
-    A Vercel entrega ao Flask o path DA FUNÇÃO (/api/index, às vezes só /), não o path
-    que o navegador pediu. Por isso esta função responde em qualquer rota e decide o que
-    devolver pelo parâmetro ?fmt=, que nenhuma reescrita da Vercel altera.
+    A Vercel entrega TUDO para esta função (o path que o Flask vê pode ser /, /api/index
+    ou o path original — varia). Por isso a decisão é pelo parâmetro ?fmt=, que nenhuma
+    reescrita altera, e o HTML mora aqui dentro em vez de depender de arquivo estático.
 
-        /api/index?fmt=health          → diagnóstico
-        /api/index?fmt=json&mes=&ano=  → dados do painel
+        /                              → o painel (HTML)
+        /api/index?fmt=json&mes=&ano=  → dados do painel (JSON)
+        /api/index?fmt=health          → diagnóstico (JSON)
     """
     modo = (request.args.get("fmt") or "").strip().lower()
     alvo = (p or "").strip("/").lower()
+
     if modo == "health" or alvo.endswith("health"):
         return health_payload()
-    return _handler()
+    if modo == "json" or alvo.endswith("navigator"):
+        return _handler()
+    return Response(PAGINA_HTML, mimetype="text/html; charset=utf-8")
 
 
 def health_payload():
@@ -664,6 +728,402 @@ def health_payload():
         "hoje_br": hoje_br().isoformat(),
         "path_recebido": request.path,
     })
+
+
+# ── PÁGINA (HTML embutido: a Vercel não serve estático neste projeto) ──────
+# Para mexer no visual do painel, edite daqui para baixo.
+PAGINA_HTML = r"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Navigator — Board Academy</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --gold:#B8860B; --gold-bg:#FFF9E6;
+    --navy:#1A1A2E; --bg:#F4F5F7; --white:#fff;
+    --text:#1E1E2E; --muted:#6B7280; --border:#E2E4E9;
+    --green:#0D7A3E; --green-bg:#F2F9F5; --green-hd:#EAF4EE;
+    --red:#B91C1C; --red-bg:#FEF2F2;
+    --amber:#92400E; --amber-bg:#FFFBEB;
+    --blue-bg:#F4F7FE;
+    --shadow:0 1px 3px rgba(0,0,0,.08);
+  }
+  body{background:var(--bg);color:var(--text);font-size:13px;
+       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif}
+
+  /* HEADER */
+  .header{background:var(--navy);height:56px;padding:0 24px;display:flex;
+          align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10;
+          box-shadow:0 4px 6px rgba(0,0,0,.07);flex-wrap:wrap}
+  .header-left{display:flex;align-items:center;gap:22px}
+  .brand{display:flex;align-items:center;gap:10px}
+  .brand-bar{width:3px;height:22px;background:var(--gold);border-radius:2px}
+  .brand-text{color:#fff;font-size:14px;font-weight:700;letter-spacing:.5px}
+  .brand-sub{color:var(--gold);font-size:10px;letter-spacing:1.5px;font-weight:600;text-transform:uppercase}
+  .periodo-badge{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+                 border-radius:6px;padding:4px 12px;color:rgba(255,255,255,.75);font-size:12px}
+  .periodo-badge strong{color:var(--gold)}
+  .header-right{display:flex;align-items:center;gap:10px}
+  .header-right select{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);
+                       border-radius:5px;color:#fff;font-size:12px;padding:5px 10px;cursor:pointer;outline:none}
+  .header-right select option{background:#1A1A2E;color:#fff}
+  .update-info{color:rgba(255,255,255,.45);font-size:11px}
+  .btn-reload{background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:5px;
+              color:rgba(255,255,255,.6);font-size:11px;padding:5px 12px;cursor:pointer;transition:all .2s}
+  .btn-reload:hover{border-color:var(--gold);color:var(--gold)}
+
+  .main{padding:22px 24px;max-width:1180px;margin:0 auto}
+
+  .block-title{font-size:11px;font-weight:700;color:var(--gold);letter-spacing:1px;
+               text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .block-title::before{content:'';width:3px;height:12px;background:var(--gold);border-radius:2px}
+  .block-title .rule{flex:1;height:1px;background:var(--border)}
+
+  .card{background:var(--white);border:1px solid var(--border);border-radius:8px;
+        box-shadow:var(--shadow);overflow:hidden;margin-bottom:26px}
+  .table-scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+
+  /* TABELA PRINCIPAL (métrica x valor) */
+  .kpi thead th{background:#F7F8FA;color:var(--muted);font-size:10px;font-weight:700;
+                letter-spacing:1px;text-transform:uppercase;padding:11px 16px;text-align:left;
+                border-bottom:1px solid var(--border);white-space:nowrap}
+  .kpi thead th.val{text-align:right;background:var(--green-hd);color:var(--green);
+                    font-size:12px;letter-spacing:1.5px;min-width:200px}
+  .kpi td{padding:10px 16px;border-bottom:1px solid #EFF1F4}
+  .kpi td.val{text-align:right;background:var(--green-bg);font-variant-numeric:tabular-nums;
+              font-weight:600;white-space:nowrap}
+  .kpi tr:last-child td{border-bottom:none}
+  .kpi tr.sep td{border-top:2px solid var(--border)}
+  .kpi tr.g-ontem td:first-child{background:#FAFAFB}
+  .kpi tr.g-hoje  td:first-child{background:var(--blue-bg)}
+  .kpi tr.g-hoje  td.val{background:#EDF3FC}
+  .kpi tr.destaque td{font-weight:700}
+  .kpi tr.destaque td:first-child{color:var(--navy)}
+  .kpi .hint{color:var(--muted);font-size:11px;font-weight:400;margin-left:6px}
+
+  .pct{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:700;min-width:56px;text-align:center}
+  .pct-green{background:#ECFDF5;color:var(--green)}
+  .pct-amber{background:var(--amber-bg);color:var(--amber)}
+  .pct-red{background:var(--red-bg);color:var(--red)}
+  .neg{color:var(--red)} .pos{color:var(--green)}
+  .zero{color:var(--muted);font-weight:400}
+
+  /* TABELA DE CLOSERS */
+  .closers thead tr{background:var(--navy)}
+  .closers thead th{color:rgba(255,255,255,.7);font-size:10px;font-weight:600;letter-spacing:.5px;
+                    text-transform:uppercase;padding:9px 14px;text-align:right;white-space:nowrap}
+  .closers thead th:first-child{text-align:left}
+  .closers td{padding:10px 14px;text-align:right;border-bottom:1px solid #EFF1F4;
+              font-variant-numeric:tabular-nums;white-space:nowrap}
+  .closers td:first-child{text-align:left;font-weight:600}
+  .closers tbody tr:hover{background:#F8F9FF}
+  .closers tr.total td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700;color:var(--navy)}
+  .closers tr.total td:first-child{color:var(--gold)}
+
+  /* AVISOS */
+  .alerta{background:var(--amber-bg);border:1px solid #F5DFA8;border-left:3px solid var(--gold);
+          border-radius:6px;padding:10px 14px;font-size:12px;color:var(--amber);margin-bottom:10px}
+  details.meta-comp{background:var(--white);border:1px solid var(--border);border-radius:8px;
+                    padding:12px 16px;font-size:12px;box-shadow:var(--shadow)}
+  details.meta-comp summary{cursor:pointer;font-weight:600;color:var(--navy);font-size:12px;outline:none}
+  details.meta-comp ul{margin:10px 0 0 18px;color:var(--muted);line-height:1.8}
+  .rodape{text-align:right;color:var(--muted);font-size:11px;font-style:italic;margin-top:14px}
+
+
+  /* PIPE A ARRUMAR */
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  .chip{border-radius:6px;padding:7px 12px;font-size:12px;border:1px solid;background:var(--white)}
+  .chip b{font-size:14px;margin-right:4px}
+  .chip-sem_data{border-color:#E8B4B4;color:var(--red);background:var(--red-bg)}
+  .chip-sem_probabilidade{border-color:#F0D9A8;color:var(--amber);background:var(--amber-bg)}
+  .chip-prob_fora{border-color:#C9D4E8;color:#1E3A8A;background:var(--blue-bg)}
+  .pend thead tr{background:var(--navy)}
+  .pend thead th{color:rgba(255,255,255,.7);font-size:10px;font-weight:600;letter-spacing:.5px;
+                 text-transform:uppercase;padding:9px 14px;text-align:left;white-space:nowrap}
+  .pend thead th.num{text-align:right}
+  .pend td{padding:9px 14px;border-bottom:1px solid #EFF1F4;font-size:12px;vertical-align:middle}
+  .pend td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pend tbody tr:hover{background:#F8F9FF}
+  .pend .tit a{color:var(--navy);text-decoration:none;font-weight:600}
+  .pend .tit a:hover{text-decoration:underline}
+  .pend .falta{color:var(--red);font-weight:700}
+  .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;
+       letter-spacing:.3px;white-space:nowrap;border:1px solid}
+  .tag-sem_data{background:var(--red-bg);color:var(--red);border-color:#E8B4B4}
+  .tag-sem_probabilidade{background:var(--amber-bg);color:var(--amber);border-color:#F0D9A8}
+  .tag-prob_fora{background:var(--blue-bg);color:#1E3A8A;border-color:#C9D4E8}
+  .pend tr.total td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700}
+  .pend-vazio{padding:22px;text-align:center;color:var(--green);font-size:12px;font-weight:600}
+
+  .loading{display:flex;align-items:center;justify-content:center;gap:12px;padding:60px;color:var(--muted)}
+  .spinner{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--gold);
+           border-radius:50%;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .erro{padding:40px;text-align:center;color:var(--red);font-size:13px}
+  .erro code{display:block;margin-top:10px;font-size:11px;color:var(--muted);white-space:pre-wrap;text-align:left}
+</style>
+</head>
+<body>
+
+<header class="header">
+  <div class="header-left">
+    <div class="brand">
+      <div class="brand-bar"></div>
+      <div>
+        <div class="brand-text">BOARD ACADEMY</div>
+        <div class="brand-sub">Funil Navigator · Closers</div>
+      </div>
+    </div>
+    <div class="periodo-badge" id="periodo-badge">Carregando…</div>
+  </div>
+  <div class="header-right">
+    <select id="sel-mes" onchange="carregar()"></select>
+    <select id="sel-ano" onchange="carregar()"></select>
+    <button class="btn-reload" onclick="carregar()">Atualizar</button>
+    <span class="update-info" id="update-info"></span>
+  </div>
+</header>
+
+<div class="main" id="conteudo">
+  <div class="card"><div class="loading"><div class="spinner"></div>Buscando dados do Navigator…</div></div>
+</div>
+
+<script>
+const MESES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
+               'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+
+// senha opcional: propagada da URL (?k=...) para a chamada da API
+const KEY = new URLSearchParams(location.search).get('k') || '';
+
+const R = v => 'R$ ' + Number(v||0).toLocaleString('pt-BR',{maximumFractionDigits:0});
+const N = v => Number(v||0).toLocaleString('pt-BR');
+const P = v => v == null ? '—' : Number(v).toFixed(1).replace('.',',') + '%';
+const esc = s => String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function pctTag(v){
+  if (v == null) return '<span class="zero">—</span>';
+  const c = v >= 100 ? 'pct-green' : v >= 60 ? 'pct-amber' : 'pct-red';
+  return `<span class="pct ${c}">${P(v)}</span>`;
+}
+function money(v, opts={}){
+  const n = Number(v||0);
+  if (n === 0 && !opts.forcar) return '<span class="zero">R$ 0</span>';
+  return R(n);
+}
+
+// ── seletores de período ──────────────────────────────────────
+(function initSelects(){
+  const hoje = new Date();
+  const brNow = new Date(hoje.getTime() - (hoje.getTimezoneOffset()+180)*60000);
+  const sm = document.getElementById('sel-mes');
+  const sa = document.getElementById('sel-ano');
+  MESES.forEach((m,i) => sm.add(new Option(m, i+1)));
+  for (let a = brNow.getFullYear()-1; a <= brNow.getFullYear()+1; a++) sa.add(new Option(a, a));
+  sm.value = brNow.getMonth()+1;
+  sa.value = brNow.getFullYear();
+})();
+
+// ── render ────────────────────────────────────────────────────
+function linha(rotulo, valorHtml, cls='', hint=''){
+  return `<tr class="${cls}">
+    <td>${rotulo}${hint ? `<span class="hint">${hint}</span>` : ''}</td>
+    <td class="val">${valorHtml}</td>
+  </tr>`;
+}
+
+function render(d){
+  const p = d.periodo, m = d.metricas;
+
+  document.getElementById('periodo-badge').innerHTML =
+    `${MESES[p.mes-1]} ${p.ano} &nbsp;·&nbsp; <strong>${p.du_passados}</strong>/${p.du_total} dias úteis
+     &nbsp;·&nbsp; <strong>${p.du_restantes}</strong> restantes`;
+  document.getElementById('update-info').textContent = 'Atualizado: ' + p.atualizado_em;
+
+  const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
+  const devHint  = `(${P(m.pct_mes_decorrido)} do mês)`;
+
+  const kpi = `
+  <div class="card">
+    <div class="table-scroll">
+      <table class="kpi">
+        <thead>
+          <tr><th>Métrica</th><th class="val">${(d.funil || 'NAVIGATOR').toUpperCase()}</th></tr>
+        </thead>
+        <tbody>
+          ${linha('Meta Mês',                 money(m.meta_mes,{forcar:1}), 'destaque')}
+          ${linha('Meta Dia',                 money(m.meta_dia,{forcar:1}))}
+          ${linha('Realizado Bruto',          money(m.real_bruto))}
+          ${linha('Realizado Multiplicador',  money(m.real_multi))}
+          ${linha('Deveria (100%) — MTD',     `${money(m.deveria_mtd,{forcar:1})} <span class="hint">${devHint}</span>`, 'sep')}
+          ${linha('Atingimento',              pctTag(m.atingimento), 'destaque', 'c/ multiplicador')}
+          ${linha('Gap 100%',                 `<span class="${gapCls}">${R(m.gap_100)}</span>`)}
+          ${linha('Meta/Dia 100%',            money(m.meta_dia_100,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
+          ${linha('Meta/Dia 100% (Bruto)',    money(m.meta_dia_100_bruto,{forcar:1}))}
+
+          ${linha(`Previsto Ontem <span class="hint">${p.ontem}</span>`, money(m.previsto_ontem), 'sep g-ontem')}
+          ${linha('Entrou Ontem (Multiplicador)', money(m.entrou_ontem_multi), 'g-ontem')}
+          ${linha('Entrou Ontem (Bruto)',         money(m.entrou_ontem_bruto), 'g-ontem')}
+
+          ${linha(`Previsto Hoje <span class="hint">${p.hoje}</span>`, money(m.previsto_hoje), 'sep g-hoje')}
+          ${linha('Em Aberto Hoje',               money(m.em_aberto_hoje), 'g-hoje')}
+          ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
+          ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
+
+          ${linha('Vendas no mês',  `${N(m.qtd_ganhos_mes)}`, 'sep')}
+          ${linha('Ticket médio',   money(m.ticket_medio))}
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+
+  // ── closers ──
+  let closersHtml = '';
+  if ((d.closers || []).length) {
+    const tb = d.closers.map(c => `
+      <tr>
+        <td>${c.nome}</td>
+        <td>${c.meta > 0 ? R(c.meta) : '<span class="zero">—</span>'}</td>
+        <td>${money(c.real_bruto)}</td>
+        <td>${money(c.real_multi)}</td>
+        <td>${pctTag(c.pct)}</td>
+        <td>${N(c.qtd)}</td>
+        <td>${money(c.ticket)}</td>
+        <td>${money(c.previsto_hoje)}</td>
+        <td>${money(c.aberto_hoje)}</td>
+      </tr>`).join('');
+
+    const t = d.closers.reduce((a,c) => ({
+      meta:a.meta+(c.meta||0), bruto:a.bruto+c.real_bruto, multi:a.multi+c.real_multi,
+      qtd:a.qtd+c.qtd, prev:a.prev+c.previsto_hoje, ab:a.ab+c.aberto_hoje
+    }), {meta:0,bruto:0,multi:0,qtd:0,prev:0,ab:0});
+
+    closersHtml = `
+    <div class="block-title">Por Closer<div class="rule"></div></div>
+    <div class="card">
+      <div class="table-scroll">
+        <table class="closers">
+          <thead><tr>
+            <th>Closer</th><th>Meta</th><th>Bruto</th><th>Multiplicador</th>
+            <th>% Ating.</th><th>Vol.</th><th>Ticket</th>
+            <th>Previsto Hoje</th><th>Em Aberto Hoje</th>
+          </tr></thead>
+          <tbody>
+            ${tb}
+            <tr class="total">
+              <td>TOTAL</td>
+              <td>${t.meta > 0 ? R(t.meta) : '—'}</td>
+              <td>${R(t.bruto)}</td>
+              <td>${R(t.multi)}</td>
+              <td>${pctTag(t.meta > 0 ? t.multi/t.meta*100 : null)}</td>
+              <td>${N(t.qtd)}</td>
+              <td>${R(t.qtd ? t.bruto/t.qtd : 0)}</td>
+              <td>${R(t.prev)}</td>
+              <td>${R(t.ab)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
+
+  // ── pipe a arrumar ──
+  let pendHtml = '';
+  const pend = d.pendencias;
+  if (pend) {
+    const ordem = ['sem_data','sem_probabilidade','prob_fora'];
+    const chips = ordem.map(k => {
+      const r = pend.resumo[k];
+      if (!r || !r.qtd) return '';
+      return `<div class="chip chip-${k}"><b>${r.qtd}</b> ${r.label} · ${R(r.valor)}</div>`;
+    }).join('');
+
+    const corpo = pend.qtd_total
+      ? pend.itens.map(i => `
+          <tr>
+            <td class="tit"><a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)} ↗</a></td>
+            <td>${esc(i.dono)}</td>
+            <td class="num">${R(i.valor)}</td>
+            <td class="num">${i.prev_fechamento || '<span class="falta">faltando</span>'}</td>
+            <td class="num">${i.probabilidade == null ? '<span class="falta">faltando</span>' : i.probabilidade + '%'}</td>
+            <td><span class="tag tag-${i.motivo}">${i.motivo_label}</span></td>
+          </tr>`).join('') +
+        `<tr class="total">
+            <td>TOTAL A CORRIGIR</td><td>${pend.qtd_total} deals</td>
+            <td class="num">${R(pend.valor_total)}</td>
+            <td class="num" colspan="3">${P(pend.valor_abertos ? pend.valor_total/pend.valor_abertos*100 : 0)} do pipe aberto (${R(pend.valor_abertos)})</td>
+         </tr>`
+      : '';
+
+    pendHtml = `
+      <div class="block-title">Pipe a arrumar<div class="rule"></div></div>
+      ${chips ? `<div class="chips">${chips}</div>` : ''}
+      <div class="card">
+        ${pend.qtd_total ? `
+        <div class="table-scroll">
+          <table class="pend">
+            <thead><tr>
+              <th>Negócio</th><th>Dono</th><th class="num">Valor</th>
+              <th class="num">Prev. Fechamento</th><th class="num">Prob.</th><th>O que falta</th>
+            </tr></thead>
+            <tbody>${corpo}</tbody>
+          </table>
+        </div>` : '<div class="pend-vazio">✓ Pipe limpo — todos os negócios abertos têm data e probabilidade preenchidas.</div>'}
+      </div>`;
+  }
+
+  // ── alertas + composição da meta ──
+  const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${a}</div>`).join('');
+  const comp = (d.meta_composicao || []).length
+    ? `<details class="meta-comp">
+         <summary>Como a Meta Mês de ${R(m.meta_mes)} foi montada (${d.meta_composicao.length} closers)</summary>
+         <ul>${d.meta_composicao.map(c => `<li>${c.nome} — ${R(c.meta)}</li>`).join('')}</ul>
+       </details>`
+    : '';
+
+  document.getElementById('conteudo').innerHTML =
+    `<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${pendHtml}${alertas}${comp}
+     <div class="rodape">Funil ${d.funil} (pipeline ${d.pipeline_id}) · atualizado em ${p.atualizado_em}</div>`;
+}
+
+// ── fetch ─────────────────────────────────────────────────────
+async function carregar(){
+  document.getElementById('conteudo').innerHTML =
+    '<div class="card"><div class="loading"><div class="spinner"></div>Buscando dados do Navigator…</div></div>';
+  try {
+    const mes = document.getElementById('sel-mes').value;
+    const ano = document.getElementById('sel-ano').value;
+    // /api/index é o path canônico da function na Vercel — sempre chega no Python.
+    // fmt=json é o que diz ao backend para devolver os dados do painel.
+    const q = new URLSearchParams({fmt: 'json', mes, ano});
+    if (KEY) q.set('k', KEY);
+    const res  = await fetch('/api/index?' + q.toString());
+    const data = await res.json();
+    if (data.erro) {
+      const extra = data.funis_disponiveis
+        ? '<code>Funis encontrados no Pipedrive:\n· ' + data.funis_disponiveis.join('\n· ') + '</code>'
+        : (data.trace ? `<code>${data.trace}</code>` : '');
+      document.getElementById('conteudo').innerHTML =
+        `<div class="card"><div class="erro">${data.erro}${extra}</div></div>`;
+      return;
+    }
+    render(data);
+  } catch (e) {
+    document.getElementById('conteudo').innerHTML =
+      `<div class="card"><div class="erro">Falha ao carregar: ${e.message}</div></div>`;
+  }
+}
+
+carregar();
+setInterval(carregar, 5 * 60 * 1000);
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
