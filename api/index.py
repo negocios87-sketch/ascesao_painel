@@ -654,6 +654,84 @@ def montar_pendencias(abertos, users, so_do_dono=""):
     }
 
 
+
+# ── AS TRÊS FRENTES DA EQUIPE ASCENSÃO/MGM ───────────────────
+# Navigator  = alunos já existentes (funil Navigator)
+# MGM        = venda nova              (funil MGM, id 92)
+# Renovação  = também no funil Navigator, separado por uma TAG (campo personalizado)
+PIPELINE_MGM = int(os.environ.get("PIPELINE_MGM", "92"))
+
+# Enquanto a tag não for configurada, Renovação fica zerada e o Navigator vem inteiro.
+# TAG_RENOVACAO_CAMPO = a chave (hash) do campo personalizado no Pipedrive
+# TAG_RENOVACAO_VALOR = o valor/label que identifica renovação
+TAG_RENOVACAO_CAMPO = os.environ.get("TAG_RENOVACAO_CAMPO", "")
+TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "")
+
+# Metas por frente e por mês (tabela de projeção Set–Dez/26)
+METAS_FRENTES = {
+    (2026,  9): {"navigator": 300000, "mgm": 120000, "renovacao": 40000},
+    (2026, 10): {"navigator": 313600, "mgm": 127300, "renovacao": 47300},
+    (2026, 11): {"navigator": 327300, "mgm": 134500, "renovacao": 54500},
+    (2026, 12): {"navigator": 340900, "mgm": 141800, "renovacao": 61800},
+}
+
+NOMES_FRENTES = {
+    "navigator": "Ascensão (Navigator)",
+    "mgm":       "Novos Negócios (MGM)",
+    "renovacao": "Renovação",
+}
+
+
+def eh_renovacao(deal):
+    """True se o deal carrega a tag de Renovação. Sem tag configurada, sempre False."""
+    if not TAG_RENOVACAO_CAMPO or not TAG_RENOVACAO_VALOR:
+        return False
+    val = cf(deal, TAG_RENOVACAO_CAMPO)
+    if val is None:
+        return False
+    alvo = norm(TAG_RENOVACAO_VALOR)
+    if isinstance(val, list):
+        return any(norm(str(v)) == alvo for v in val)
+    return norm(str(val)) == alvo or str(val) == str(TAG_RENOVACAO_VALOR)
+
+
+def contar_reunioes(mes, ano, users, dias):
+    """
+    Reuniões por dia, das pessoas da equipe (closers + SDRs).
+      previstas  = atividades do filtro de reuniões com due_date naquele dia
+      realizadas = as concluídas, cujo responsável != dono do deal e cujo deal
+                   está no filtro de Reunião Validada (mesma régua do gerente_comercial)
+    """
+    equipe = set(_lista_norm(CLOSERS_LISTA)) | set(_lista_norm(SDRS_LISTA))
+    uids = {str(uid) for uid, nome in users.items() if norm(nome) in equipe}
+    out = {d: {"previstas": 0, "realizadas": 0} for d in dias}
+    if not uids:
+        return out
+
+    acts = buscar_activities_mes(mes, ano)
+    ids_rv, mapa_dono = buscar_deals_rv()
+
+    for a in acts:
+        dono_act = str(a.get("owner_id", ""))
+        if dono_act not in uids:
+            continue
+        dia = str(a.get("due_date", "") or "")[:10]
+        if dia not in out:
+            continue
+        out[dia]["previstas"] += 1
+
+        if not (a.get("done") is True or a.get("status") == "done"):
+            continue
+        deal_id = a.get("deal_id")
+        dono_deal = str(mapa_dono.get(deal_id, "")) if deal_id else ""
+        if dono_act and dono_deal and dono_act == dono_deal:
+            continue
+        if deal_id and deal_id not in ids_rv:
+            continue
+        out[dia]["realizadas"] += 1
+    return out
+
+
 def calcular_navigator(mes=None, ano=None):
     hoje = hoje_br()
     mes = mes or hoje.month
@@ -812,6 +890,13 @@ def calcular_navigator(mes=None, ano=None):
     except Exception as e:
         erro_sdr = f"{type(e).__name__}: {e}"
 
+    # ── Reuniões de hoje e do último DU ───────────────────────
+    reunioes, erro_reu = {}, None
+    try:
+        reunioes = contar_reunioes(mes, ano, users, [ontem_str, hoje_str])
+    except Exception as e:
+        erro_reu = f"{type(e).__name__}: {e}"
+
     # ── Pendências do pipe + alertas ──────────────────────────
     pend = montar_pendencias(abertos, users, so_do_dono=PENDENCIAS_DONO)
 
@@ -822,6 +907,8 @@ def calcular_navigator(mes=None, ano=None):
             + " e meta financeira no METAS — a Meta Mês veio zerada.")
     if erro_sdr:
         alertas.append("Não consegui calcular as métricas de SDR agora — " + erro_sdr)
+    if erro_reu:
+        alertas.append("Não consegui contar as reuniões agora — " + erro_reu)
     for chave in ("sem_data", "sem_probabilidade", "prob_fora"):
         r = pend["resumo"][chave]
         if r["qtd"]:
@@ -841,10 +928,177 @@ def calcular_navigator(mes=None, ano=None):
         "metricas": metricas,
         "closers": closers,
         "sdrs": sdrs,
+        "reunioes": {
+            "hoje":  reunioes.get(hoje_str,  {"previstas": 0, "realizadas": 0}),
+            "ontem": reunioes.get(ontem_str, {"previstas": 0, "realizadas": 0}),
+        },
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
         "meta_composicao": sorted(closers_meta, key=lambda x: -x["meta"]),
         "pendencias": pend,
+        "alertas": alertas,
+    }
+
+
+
+# ── RESUMO DAS TRÊS FRENTES ───────────────────────────────────
+def calcular_resumo(mes=None, ano=None):
+    """
+    Consolida as três frentes da equipe Ascensão/MGM:
+      navigator  → funil Navigator, sem a tag de Renovação
+      mgm        → funil MGM (PIPELINE_MGM)
+      renovacao  → funil Navigator, com a tag de Renovação
+    """
+    hoje = hoje_br()
+    mes = mes or hoje.month
+    ano = ano or hoje.year
+    hoje_str = hoje.strftime("%Y-%m-%d")
+
+    feriados = buscar_feriados()
+    metas_sheet = buscar_metas(ano, mes)
+
+    du_calc = du_mes_total(ano, mes, feriados)
+    du_sheet = next((m["dias_uteis"] for m in metas_sheet if m["dias_uteis"] > 0), 0)
+    du_total = du_sheet if du_sheet > 0 else du_calc
+
+    mes_fechado = (ano < hoje.year) or (ano == hoje.year and mes < hoje.month)
+    mes_futuro = (ano > hoje.year) or (ano == hoje.year and mes > hoje.month)
+    if mes_fechado:
+        du_pass = du_total
+    elif mes_futuro:
+        du_pass = 0
+    else:
+        du_pass = min(du_passados(ano, mes, feriados), du_total)
+    du_rest = max(du_total - du_pass, 0)
+
+    pipe = buscar_pipeline_id()
+    pid_nav = pipe["id"]
+    if not pid_nav:
+        return {"erro": f"Funil '{FUNIL_NOME}' não encontrado.",
+                "funis_disponiveis": pipe["todos"]}
+
+    users = buscar_users()
+    ganhos_nav = buscar_ganhos(mes, ano, pid_nav)
+    abertos_nav = buscar_abertos(pid_nav)
+
+    erro_mgm = None
+    ganhos_mgm, abertos_mgm = [], []
+    try:
+        ganhos_mgm = buscar_ganhos(mes, ano, PIPELINE_MGM)
+        abertos_mgm = buscar_abertos(PIPELINE_MGM)
+    except Exception as e:
+        erro_mgm = f"{type(e).__name__}: {e}"
+
+    tag_ativa = bool(TAG_RENOVACAO_CAMPO and TAG_RENOVACAO_VALOR)
+    grupos = {
+        "navigator": {
+            "ganhos":  [d for d in ganhos_nav if not eh_renovacao(d)],
+            "abertos": [d for d in abertos_nav if not eh_renovacao(d)],
+        },
+        "mgm": {"ganhos": ganhos_mgm, "abertos": abertos_mgm},
+        "renovacao": {
+            "ganhos":  [d for d in ganhos_nav if eh_renovacao(d)],
+            "abertos": [d for d in abertos_nav if eh_renovacao(d)],
+        },
+    }
+
+    metas_mes = METAS_FRENTES.get((ano, mes), {})
+    frentes = []
+    for chave in ("navigator", "mgm", "renovacao"):
+        g = grupos[chave]["ganhos"]
+        a = grupos[chave]["abertos"]
+        meta = float(metas_mes.get(chave, 0))
+        bruto = sum(float(d.get("value") or 0) for d in g)
+        multi = sum(float(cf(d, CF_MULTIPLICADOR) or 0) for d in g)
+        b = bucket_dia(a, hoje_str)
+        em_aberto_total = sum(float(d.get("value") or 0) for d in a)
+        gap = meta - multi
+        frentes.append({
+            "chave": chave,
+            "nome": NOMES_FRENTES[chave],
+            "meta": arred(meta),
+            "meta_dia": arred(safe_div(meta, du_total)),
+            "deveria_mtd": arred(safe_div(meta, du_total) * du_pass),
+            "real_bruto": arred(bruto),
+            "real_multi": arred(multi),
+            "pct": arred(safe_div(multi, meta) * 100) if meta else None,
+            "gap": arred(gap),
+            "meta_dia_rest": arred(safe_div(gap, du_rest)) if du_rest and meta else 0.0,
+            "qtd": len(g),
+            "ticket": arred(safe_div(bruto, len(g))) if g else 0.0,
+            "pipe_aberto": arred(em_aberto_total),
+            "previsto_hoje": b["previsto"],
+            "em_aberto_hoje": b["em_aberto"],
+            "qtd_abertos": len(a),
+        })
+
+    def soma(campo):
+        return arred(sum(f[campo] or 0 for f in frentes))
+
+    total_meta = soma("meta")
+    total_multi = soma("real_multi")
+    total = {
+        "nome": "TOTAL",
+        "meta": total_meta,
+        "meta_dia": arred(safe_div(total_meta, du_total)),
+        "deveria_mtd": arred(safe_div(total_meta, du_total) * du_pass),
+        "real_bruto": soma("real_bruto"),
+        "real_multi": total_multi,
+        "pct": arred(safe_div(total_multi, total_meta) * 100) if total_meta else None,
+        "gap": arred(total_meta - total_multi),
+        "meta_dia_rest": arred(safe_div(total_meta - total_multi, du_rest)) if du_rest and total_meta else 0.0,
+        "qtd": sum(f["qtd"] for f in frentes),
+        "ticket": arred(safe_div(soma("real_bruto"), sum(f["qtd"] for f in frentes))) if sum(f["qtd"] for f in frentes) else 0.0,
+        "pipe_aberto": soma("pipe_aberto"),
+        "previsto_hoje": soma("previsto_hoje"),
+        "em_aberto_hoje": soma("em_aberto_hoje"),
+        "qtd_abertos": sum(f["qtd_abertos"] for f in frentes),
+    }
+
+    # projeção Set–Dez, para contexto
+    projecao = []
+    for (a_, m_), vals in sorted(METAS_FRENTES.items()):
+        projecao.append({
+            "ano": a_, "mes": m_,
+            "rotulo": ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][m_-1] + f"/{str(a_)[2:]}",
+            "navigator": vals["navigator"], "mgm": vals["mgm"], "renovacao": vals["renovacao"],
+            "total": vals["navigator"] + vals["mgm"] + vals["renovacao"],
+            "atual": (a_ == ano and m_ == mes),
+        })
+
+    meta_planilha = sum(
+        m["meta_fin"] for m in metas_sheet
+        if m["meta_reu"] == 0 and m["meta_fin"] > 0 and m["nome_norm"] not in EXCLUIR_PESSOAS
+        and norm(next((c["subarea"] for c in buscar_colaboradores(mes, ano)
+                       if c["nome_norm"] == m["nome_norm"]), "")) in _subareas())
+
+    alertas = []
+    if not tag_ativa:
+        alertas.append("A tag de Renovação ainda não foi configurada — a frente aparece zerada "
+                       "e o Navigator está vindo inteiro. Preencha TAG_RENOVACAO_CAMPO e "
+                       "TAG_RENOVACAO_VALOR nas variáveis de ambiente.")
+    if not metas_mes:
+        alertas.append(f"Não tenho metas por frente cadastradas para {mes:02d}/{ano} — "
+                       "as metas do resumo vieram zeradas.")
+    if erro_mgm:
+        alertas.append("Não consegui ler o funil MGM agora — " + erro_mgm)
+    if metas_mes and meta_planilha and abs(meta_planilha - total_meta) > 1:
+        alertas.append(f"As metas por frente somam R$ {total_meta:,.0f}".replace(",", ".")
+                       + f", mas a planilha METAS traz R$ {meta_planilha:,.0f}".replace(",", ".")
+                       + " para os closers da Ascensão. Vale conferir qual das duas manda.")
+
+    return {
+        "periodo": {
+            "mes": mes, "ano": ano,
+            "du_total": du_total, "du_passados": du_pass, "du_restantes": du_rest,
+            "hoje": hoje_str,
+            "atualizado_em": agora_br().strftime("%d/%m/%Y %H:%M"),
+        },
+        "frentes": frentes,
+        "total": total,
+        "projecao": projecao,
+        "meta_planilha": arred(meta_planilha),
+        "tag_renovacao_ativa": tag_ativa,
         "alertas": alertas,
     }
 
@@ -858,7 +1112,7 @@ def autorizado():
 
 
 # ── ROTAS ─────────────────────────────────────────────────────
-def _handler():
+def _handler(fn=None):
     if not API_KEY:
         return jsonify({"erro": "PIPE_API_KEY não configurada nas variáveis de ambiente."}), 500
     if not autorizado():
@@ -866,7 +1120,7 @@ def _handler():
     try:
         mes = request.args.get("mes", type=int)
         ano = request.args.get("ano", type=int)
-        data = calcular_navigator(mes=mes, ano=ano)
+        data = (fn or calcular_navigator)(mes=mes, ano=ano)
         status = 400 if data.get("erro") else 200
         return jsonify(limpar_nans(data)), status
     except req.HTTPError as e:
@@ -894,6 +1148,8 @@ def roteador(p):
 
     if modo == "health" or alvo.endswith("health"):
         return health_payload()
+    if modo == "resumo" or alvo.endswith("resumo"):
+        return _handler(calcular_resumo)
     if modo == "json" or alvo.endswith("navigator"):
         return _handler()
     return Response(PAGINA_HTML, mimetype="text/html; charset=utf-8")
@@ -1028,6 +1284,43 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .rodape{text-align:right;color:var(--muted);font-size:11px;font-style:italic;margin-top:14px}
 
 
+  /* ABAS */
+  .tabs{background:var(--white);border-bottom:1px solid var(--border);padding:0 24px;display:flex}
+  .tab{padding:12px 18px;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted);
+       border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .15s;letter-spacing:.3px}
+  .tab:hover{color:var(--navy)}
+  .tab.on{color:var(--gold);border-bottom-color:var(--gold)}
+  .view{display:none}
+  .view.on{display:block}
+
+  /* RESUMO DAS FRENTES */
+  .frentes thead tr{background:var(--navy)}
+  .frentes thead th{color:rgba(255,255,255,.7);font-size:10px;font-weight:600;letter-spacing:.5px;
+                    text-transform:uppercase;padding:10px 14px;text-align:right;white-space:nowrap}
+  .frentes thead th:first-child{text-align:left}
+  .frentes td{padding:11px 14px;text-align:right;border-bottom:1px solid #EFF1F4;
+              font-variant-numeric:tabular-nums;white-space:nowrap}
+  .frentes td:first-child{text-align:left;font-weight:700;color:var(--navy)}
+  .frentes tbody tr:hover{background:#F8F9FF}
+  .frentes tr.total td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700}
+  .frentes tr.total td:first-child{color:var(--gold)}
+  .frentes tr.zerada td:first-child{color:var(--muted)}
+  .frentes tr.zerada td{color:var(--muted)}
+  .proj td, .proj th{padding:9px 14px;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
+  .proj th{background:var(--navy);color:rgba(255,255,255,.7);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+  .proj th:first-child, .proj td:first-child{text-align:left}
+  .proj tbody tr{border-bottom:1px solid #EFF1F4}
+  .proj tr.mes-atual td{background:var(--amber-bg);font-weight:700}
+  .proj tr.soma td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:22px}
+  .kcard{background:var(--white);border:1px solid var(--border);border-left:3px solid var(--gold);
+         border-radius:8px;padding:14px 16px;box-shadow:var(--shadow)}
+  .kcard .rot{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+  .kcard .val{font-size:22px;font-weight:700;color:var(--navy);margin-top:6px;font-variant-numeric:tabular-nums}
+  .kcard .sub{font-size:11px;color:var(--muted);margin-top:3px}
+  .kcard.hoje{border-left-color:#1E3A8A;background:var(--blue-bg)}
+  .kcard.ontem{border-left-color:var(--muted)}
+
   .peso-nota{font-size:10px;font-weight:600;color:var(--muted);text-transform:none;letter-spacing:0}
 
   /* PIPE A ARRUMAR */
@@ -1077,15 +1370,29 @@ PAGINA_HTML = r"""<!DOCTYPE html>
     <div class="periodo-badge" id="periodo-badge">Carregando…</div>
   </div>
   <div class="header-right">
-    <select id="sel-mes" onchange="carregar()"></select>
-    <select id="sel-ano" onchange="carregar()"></select>
+    <select id="sel-mes" onchange="carregar(); if(resumoCarregado||document.getElementById('view-resumo').classList.contains('on')) carregarResumo();"></select>
+    <select id="sel-ano" onchange="carregar(); if(resumoCarregado||document.getElementById('view-resumo').classList.contains('on')) carregarResumo();"></select>
     <button class="btn-reload" onclick="carregar()">Atualizar</button>
     <span class="update-info" id="update-info"></span>
   </div>
 </header>
 
-<div class="main" id="conteudo">
-  <div class="card"><div class="loading"><div class="spinner"></div>Buscando dados do Navigator…</div></div>
+<div class="tabs">
+  <div class="tab on" id="tab-mes"    onclick="setView('mes')">Painel do Mês</div>
+  <div class="tab"    id="tab-resumo" onclick="setView('resumo')">Resumo — 3 Frentes</div>
+</div>
+
+<div class="main">
+  <div class="view on" id="view-mes">
+    <div id="conteudo">
+      <div class="card"><div class="loading"><div class="spinner"></div>Buscando dados…</div></div>
+    </div>
+  </div>
+  <div class="view" id="view-resumo">
+    <div id="conteudo-resumo">
+      <div class="card"><div class="loading"><div class="spinner"></div>Carregando resumo…</div></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1140,6 +1447,45 @@ function render(d){
      &nbsp;·&nbsp; <strong>${p.du_restantes}</strong> restantes`;
   document.getElementById('update-info').textContent = 'Atualizado: ' + p.atualizado_em;
 
+
+  // ── respostas rápidas: ontem e hoje ──
+  const reu = d.reunioes || {hoje:{}, ontem:{}};
+  const dh = d.detalhe_hoje || {};
+  const respostas = `
+    <div class="cards">
+      <div class="kcard ontem">
+        <div class="rot">Reuniões — Último DU</div>
+        <div class="val">${N(reu.ontem.realizadas || 0)}</div>
+        <div class="sub">realizadas de ${N(reu.ontem.previstas || 0)} agendadas · ${p.ontem}</div>
+      </div>
+      <div class="kcard ontem">
+        <div class="rot">Vendas — Último DU</div>
+        <div class="val">${R(m.entrou_ontem_multi)}</div>
+        <div class="sub">c/ multiplicador · bruto ${R(m.entrou_ontem_bruto)}</div>
+      </div>
+      <div class="kcard hoje">
+        <div class="rot">Reuniões — Hoje</div>
+        <div class="val">${N(reu.hoje.previstas || 0)}</div>
+        <div class="sub">agendadas · ${N(reu.hoje.realizadas || 0)} já realizadas</div>
+      </div>
+      <div class="kcard hoje">
+        <div class="rot">Vendas — Hoje</div>
+        <div class="val">${R(m.entrou_hoje_multi)}</div>
+        <div class="sub">c/ multiplicador · bruto ${R(m.entrou_hoje_bruto)}</div>
+      </div>
+    </div>
+    <div class="cards">
+      <div class="kcard hoje"><div class="rot">Pipe 70% — Hoje</div>
+        <div class="val">${R(dh.p70 || 0)}</div><div class="sub">pondera ${R((dh.p70||0)*0.7)}</div></div>
+      <div class="kcard hoje"><div class="rot">Pipe 50% — Hoje</div>
+        <div class="val">${R(dh.p50 || 0)}</div><div class="sub">pondera ${R((dh.p50||0)*0.5)}</div></div>
+      <div class="kcard hoje"><div class="rot">Pipe 20% — Hoje</div>
+        <div class="val">${R(dh.p20 || 0)}</div><div class="sub">pondera ${R((dh.p20||0)*0.2)}</div></div>
+      <div class="kcard"><div class="rot">Previsto Hoje</div>
+        <div class="val">${R(m.previsto_hoje)}</div>
+        <div class="sub">de ${R(m.em_aberto_hoje)} em aberto (${dh.qtd || 0} negócios)</div></div>
+    </div>`;
+
   const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
   const devHint  = `(${P(m.pct_mes_decorrido)} do mês)`;
 
@@ -1167,6 +1513,11 @@ function render(d){
 
           ${linha(`Previsto Hoje <span class="hint">${p.hoje}</span>`, money(m.previsto_hoje), 'sep g-hoje')}
           ${linha('Em Aberto Hoje',               money(m.em_aberto_hoje), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 70%',        money(dh.p70), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 50%',        money(dh.p50), 'g-hoje')}
+          ${linha('&nbsp;&nbsp;· Pipe 20%',        money(dh.p20), 'g-hoje')}
+          ${linha('Reuniões Hoje (agendadas)',     N(reu.hoje.previstas || 0), 'g-hoje')}
+          ${linha('Reuniões Último DU (realizadas)', N(reu.ontem.realizadas || 0), 'g-ontem')}
           ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
           ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
 
@@ -1324,7 +1675,7 @@ function render(d){
     : '';
 
   document.getElementById('conteudo').innerHTML =
-    `<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${sdrHtml}${pendHtml}${alertas}${comp}
+    `${respostas}<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${sdrHtml}${pendHtml}${alertas}${comp}
      <div class="rodape">Funil ${d.funil} (pipeline ${d.pipeline_id}) · atualizado em ${p.atualizado_em}</div>`;
 }
 
@@ -1333,6 +1684,7 @@ async function carregar(){
   document.getElementById('conteudo').innerHTML =
     '<div class="card"><div class="loading"><div class="spinner"></div>Buscando dados do Navigator…</div></div>';
   try {
+    resumoCarregado = false;
     const mes = document.getElementById('sel-mes').value;
     const ano = document.getElementById('sel-ano').value;
     // /api/index é o path canônico da function na Vercel — sempre chega no Python.
@@ -1356,8 +1708,109 @@ async function carregar(){
   }
 }
 
+// ── ABAS ──────────────────────────────────────────────────────
+let resumoCarregado = false;
+function setView(v){
+  ['mes','resumo'].forEach(k => {
+    document.getElementById('view-' + k).classList.toggle('on', k === v);
+    document.getElementById('tab-' + k).classList.toggle('on', k === v);
+  });
+  location.hash = v === 'resumo' ? '#resumo' : '';
+  if (v === 'resumo' && !resumoCarregado) carregarResumo();
+}
+
+// ── RESUMO DAS 3 FRENTES ──────────────────────────────────────
+function renderResumo(d){
+  const p = d.periodo;
+  const linhaFrente = (f, cls='') => `
+    <tr class="${cls}${(f.meta === 0 && f.real_multi === 0) ? ' zerada' : ''}">
+      <td>${esc(f.nome)}</td>
+      <td>${f.meta > 0 ? R(f.meta) : '<span class="zero">—</span>'}</td>
+      <td>${f.deveria_mtd > 0 ? R(f.deveria_mtd) : '<span class="zero">—</span>'}</td>
+      <td>${money(f.real_bruto)}</td>
+      <td>${money(f.real_multi)}</td>
+      <td>${pctTag(f.pct)}</td>
+      <td>${f.meta > 0 ? `<span class="${f.gap > 0 ? 'neg' : 'pos'}">${R(f.gap)}</span>` : '<span class="zero">—</span>'}</td>
+      <td>${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</td>
+      <td>${N(f.qtd)}</td>
+      <td>${money(f.pipe_aberto)}</td>
+      <td>${money(f.previsto_hoje)}</td>
+    </tr>`;
+
+  const proj = d.projecao.map(x => `
+    <tr class="${x.atual ? 'mes-atual' : ''}">
+      <td>${x.rotulo}${x.atual ? ' ◀' : ''}</td>
+      <td>${R(x.navigator)}</td><td>${R(x.mgm)}</td><td>${R(x.renovacao)}</td>
+      <td><b>${R(x.total)}</b></td>
+    </tr>`).join('');
+  const somaProj = d.projecao.reduce((a,x) => ({
+    n:a.n+x.navigator, m:a.m+x.mgm, r:a.r+x.renovacao, t:a.t+x.total}), {n:0,m:0,r:0,t:0});
+
+  const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
+
+  document.getElementById('conteudo-resumo').innerHTML = `
+    <div class="cards">
+      <div class="kcard"><div class="rot">Meta do Mês</div><div class="val">${R(d.total.meta)}</div>
+        <div class="sub">três frentes somadas</div></div>
+      <div class="kcard"><div class="rot">Realizado</div><div class="val">${R(d.total.real_multi)}</div>
+        <div class="sub">c/ multiplicador · bruto ${R(d.total.real_bruto)}</div></div>
+      <div class="kcard"><div class="rot">Atingimento</div><div class="val">${P(d.total.pct)}</div>
+        <div class="sub">deveria estar em ${R(d.total.deveria_mtd)}</div></div>
+      <div class="kcard"><div class="rot">Falta por dia</div><div class="val">${R(d.total.meta_dia_rest)}</div>
+        <div class="sub">nos ${p.du_restantes} DU restantes</div></div>
+    </div>
+
+    <div class="block-title">Por frente — ${MESES[p.mes-1]} ${p.ano}<div class="rule"></div></div>
+    <div class="card"><div class="table-scroll">
+      <table class="frentes">
+        <thead><tr>
+          <th>Frente</th><th>Meta</th><th>Deveria (MTD)</th><th>Bruto</th><th>Multiplicador</th>
+          <th>% Ating.</th><th>Gap</th><th>Falta/Dia</th><th>Vol.</th>
+          <th>Pipe Aberto</th><th>Previsto Hoje</th>
+        </tr></thead>
+        <tbody>
+          ${d.frentes.map(f => linhaFrente(f)).join('')}
+          ${linhaFrente(d.total, 'total')}
+        </tbody>
+      </table>
+    </div></div>
+
+    <div class="block-title">Projeção Set–Dez/26<div class="rule"></div></div>
+    <div class="card"><div class="table-scroll">
+      <table class="proj">
+        <thead><tr><th>Mês</th><th>Ascensão (Navigator)</th><th>Novos Negócios (MGM)</th>
+          <th>Renovação</th><th>Total</th></tr></thead>
+        <tbody>${proj}
+          <tr class="soma"><td>TOTAL</td><td>${R(somaProj.n)}</td><td>${R(somaProj.m)}</td>
+            <td>${R(somaProj.r)}</td><td>${R(somaProj.t)}</td></tr>
+        </tbody>
+      </table>
+    </div></div>
+    ${alertas}
+    <div class="rodape">Atualizado em ${p.atualizado_em} · ${p.du_passados}/${p.du_total} dias úteis</div>`;
+}
+
+async function carregarResumo(){
+  document.getElementById('conteudo-resumo').innerHTML =
+    '<div class="card"><div class="loading"><div class="spinner"></div>Carregando resumo…</div></div>';
+  try {
+    const q = new URLSearchParams({fmt:'resumo',
+      mes: document.getElementById('sel-mes').value,
+      ano: document.getElementById('sel-ano').value});
+    if (KEY) q.set('k', KEY);
+    const data = await (await fetch('/api/index?' + q)).json();
+    if (data.erro) throw new Error(data.erro);
+    renderResumo(data);
+    resumoCarregado = true;
+  } catch(e) {
+    document.getElementById('conteudo-resumo').innerHTML =
+      `<div class="card"><div class="erro">Erro: ${esc(e.message)}</div></div>`;
+  }
+}
+
 carregar();
-setInterval(carregar, 5 * 60 * 1000);
+if (location.hash === '#resumo') setView('resumo');
+setInterval(() => { carregar(); if (resumoCarregado) carregarResumo(); }, 5 * 60 * 1000);
 </script>
 </body>
 </html>
