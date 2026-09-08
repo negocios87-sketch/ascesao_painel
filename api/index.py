@@ -157,6 +157,30 @@ def du_passados(ano, mes, feriados=frozenset()):
                    if date(ano, mes, d).weekday() < 5 and date(ano, mes, d) not in feriados), 1)
 
 
+def due_br(act):
+    """
+    (data, hora) da atividade no fuso de São Paulo.
+
+    A API do Pipedrive devolve due_date/due_time em UTC: uma reunião marcada para
+    07/09 às 21:00 BRT chega como due_date 2026-09-08 e due_time 00:00. Sem esta
+    conversão, tudo depois das 21:00 cai no dia seguinte e as horas saem 3h adiantadas.
+
+    Atividade de dia inteiro (sem due_time) não tem hora para converter — a data fica
+    como está.
+    """
+    d = str(act.get("due_date", "") or "")[:10]
+    t = str(act.get("due_time", "") or "")[:5]
+    if not d:
+        return "", None
+    if not t:
+        return d, None
+    try:
+        dt = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M") - timedelta(hours=3)
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+    except Exception:
+        return d, t
+
+
 def ultimo_du(ref, feriados=frozenset()):
     """Último dia útil ANTES de `ref` (pula fim de semana e feriado)."""
     d = ref - timedelta(days=1)
@@ -426,7 +450,12 @@ def buscar_qual_ids():
 def buscar_activities_mes(mes, ano):
     """Atividades do filtro de reuniões, com due_date dentro do mês."""
     def _fetch():
-        mes_str = f"{ano}-{mes:02d}"
+        # A janela em UTC precisa ser mais larga que o mês em BR: uma atividade de
+        # 30/09 21:00 BRT chega como 01/10 00:00 UTC. Filtra largo aqui e converte
+        # com due_br() na hora de usar.
+        ini = date(ano, mes, 1).isoformat()
+        prox = date(ano + (1 if mes == 12 else 0), 1 if mes == 12 else mes + 1, 1)
+        fim = prox.isoformat()
         todos, cursor = [], None
         while True:
             params = {"filter_id": FILTER_ACTIVITIES, "limit": 500}
@@ -438,7 +467,7 @@ def buscar_activities_mes(mes, ano):
             data = r.json()
             lote = data.get("data") or []
             todos += [a for a in lote
-                      if str(a.get("due_date", "") or "")[:7] == mes_str]
+                      if ini <= str(a.get("due_date", "") or "")[:10] <= fim]
             cursor = (data.get("additional_data") or {}).get("next_cursor")
             if not cursor or not lote:
                 break
@@ -514,8 +543,11 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
     uid_por_nome = {norm(nome): uid for uid, nome in users.items()}
     metas_por_nome = {m["nome_norm"]: m for m in metas}
 
+    mes_str = f"{ano}-{mes:02d}"
     acts_por_owner = {}
     for a in acts:
+        if due_br(a)[0][:7] != mes_str:     # fora do mês depois de converter
+            continue
         acts_por_owner.setdefault(str(a.get("owner_id", "")), []).append(a)
 
     def valida(a):
@@ -821,7 +853,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
         dono_act = str(a.get("owner_id", ""))
         if dono_act not in uids:
             continue
-        dia = str(a.get("due_date", "") or "")[:10]
+        dia, hora = due_br(a)          # UTC -> BRT
         if dia not in contagem:
             continue
 
@@ -841,7 +873,6 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None):
         else:
             status = "realizada"
 
-        hora = str(a.get("due_time", "") or "")[:5]
         detalhe[dia].append({
             "deal_id": deal_id,
             "responsavel": uids[dono_act],
