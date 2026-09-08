@@ -784,8 +784,32 @@ def calcular_navigator(mes=None, ano=None):
         }
 
     users = buscar_users()
-    ganhos = buscar_ganhos(mes, ano, pid)
-    abertos = buscar_abertos(pid)
+
+    # O Painel do Mês é CONSOLIDADO: Navigator + MGM juntos.
+    # A separação por frente vive só na aba "Resumo — 3 Frentes".
+    ganhos_nav = buscar_ganhos(mes, ano, pid)
+    abertos_nav = buscar_abertos(pid)
+
+    erro_mgm = None
+    ganhos_mgm, abertos_mgm = [], []
+    if PIPELINE_MGM:
+        try:
+            ganhos_mgm = buscar_ganhos(mes, ano, PIPELINE_MGM)
+            abertos_mgm = buscar_abertos(PIPELINE_MGM)
+        except Exception as e:
+            erro_mgm = f"{type(e).__name__}: {e}"
+
+    ganhos = ganhos_nav + ganhos_mgm
+    abertos = abertos_nav + abertos_mgm
+
+    composicao = {
+        "navigator": {"qtd": len(ganhos_nav),
+                      "valor": arred(sum(float(d.get("value") or 0) for d in ganhos_nav)),
+                      "abertos": len(abertos_nav)},
+        "mgm": {"qtd": len(ganhos_mgm),
+                "valor": arred(sum(float(d.get("value") or 0) for d in ganhos_mgm)),
+                "abertos": len(abertos_mgm)},
+    }
 
     # ── Realizado ─────────────────────────────────────────────
     real_bruto = sum(float(d.get("value") or 0) for d in ganhos)
@@ -905,6 +929,9 @@ def calcular_navigator(mes=None, ano=None):
         alertas.append(
             "Nenhum closer com Subarea = " + "/".join(sorted(subareas))
             + " e meta financeira no METAS — a Meta Mês veio zerada.")
+    if erro_mgm:
+        alertas.append("Não consegui ler o funil MGM agora, os números estão só com o "
+                       "Navigator — " + erro_mgm)
     if erro_sdr:
         alertas.append("Não consegui calcular as métricas de SDR agora — " + erro_sdr)
     if erro_reu:
@@ -919,6 +946,8 @@ def calcular_navigator(mes=None, ano=None):
         "funil": pipe["nome"],
         "rotulo": ROTULO_FUNIL,
         "pipeline_id": pid,
+        "consolidado": True,
+        "composicao": composicao,
         "periodo": {
             "mes": mes, "ano": ano,
             "du_total": du_total, "du_passados": du_pass, "du_restantes": du_rest,
@@ -1321,6 +1350,9 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard.hoje{border-left-color:#1E3A8A;background:var(--blue-bg)}
   .kcard.ontem{border-left-color:var(--muted)}
 
+  .nota-comp{font-size:11px;color:var(--muted);padding:9px 4px 0;line-height:1.6}
+  .nota-comp b{color:var(--navy)}
+
   .peso-nota{font-size:10px;font-weight:600;color:var(--muted);text-transform:none;letter-spacing:0}
 
   /* PIPE A ARRUMAR */
@@ -1364,7 +1396,7 @@ PAGINA_HTML = r"""<!DOCTYPE html>
       <div class="brand-bar"></div>
       <div>
         <div class="brand-text">BOARD ACADEMY</div>
-        <div class="brand-sub" id="brand-sub">Ascensão/MGM · Closers e SDR</div>
+        <div class="brand-sub" id="brand-sub">Ascensão/MGM · Consolidado</div>
       </div>
     </div>
     <div class="periodo-badge" id="periodo-badge">Carregando…</div>
@@ -1489,6 +1521,12 @@ function render(d){
   const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
   const devHint  = `(${P(m.pct_mes_decorrido)} do mês)`;
 
+  const cFunis = d.composicao || {};
+  const notaComp = d.consolidado ? `
+    <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
+      ${R(cFunis.navigator?.valor || 0)} &nbsp;+&nbsp; <b>MGM</b> ${N(cFunis.mgm?.qtd || 0)} venda(s) ·
+      ${R(cFunis.mgm?.valor || 0)}. A separação por frente fica na aba Resumo.</div>` : '';
+
   const kpi = `
   <div class="card">
     <div class="table-scroll">
@@ -1526,7 +1564,7 @@ function render(d){
         </tbody>
       </table>
     </div>
-  </div>`;
+  </div>${notaComp}`;
 
   // ── closers ──
   let closersHtml = '';
