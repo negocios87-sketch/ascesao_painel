@@ -1109,6 +1109,13 @@ def calcular_navigator(mes=None, ano=None):
         "ticket_medio":       arred(safe_div(real_bruto, len(ganhos))) if ganhos else 0.0,
     }
 
+    # ── Forecast de hoje em diante (bloco "Forecast" do painel) ──
+    import calendar as _cal_fx
+    _ult = _cal_fx.monthrange(ano, mes)[1]
+    todos_dias_mes = [date(ano, mes, i).strftime("%Y-%m-%d") for i in range(1, _ult + 1)]
+    dias_futuros = [d for d in todos_dias_mes if d >= hoje_str]
+    b_futuro = bucket_dias(abertos, dias_futuros)
+
     # ── Quebra por closer (dono do deal) ──────────────────────
     por_closer = {}
     for d in ganhos:
@@ -1181,11 +1188,39 @@ def calcular_navigator(mes=None, ano=None):
         "agendadas":  sum((cont_reu.get(d) or {}).get("agendadas", 0)  for d in dias_mes),
         "realizadas": sum((cont_reu.get(d) or {}).get("realizadas", 0) for d in dias_mes),
     }
+    # futuras = depois de hoje (hoje tem card próprio)
+    dias_depois = [d for d in dias_mes if d > hoje_str]
+    reu_futuras = {
+        "agendadas": sum((cont_reu.get(d) or {}).get("agendadas", 0) for d in dias_depois),
+        "dias": sum(1 for d in dias_depois if (cont_reu.get(d) or {}).get("agendadas", 0)),
+    }
+
+    # ── As 3 frentes, embutidas no Painel do Mês ──────────────
+    # (a aba "Resumo — 3 Frentes" deixou de existir; o cálculo é o mesmo e as
+    #  chamadas ao Pipedrive estão em cache, então não custa requisição extra)
+    resumo_frentes, erro_frentes = None, None
+    try:
+        r_fr = calcular_resumo(mes, ano)
+        if not r_fr.get("erro"):
+            resumo_frentes = {
+                "linhas": r_fr["frentes"], "total": r_fr["total"],
+                "tag_renovacao_ativa": r_fr["tag_renovacao_ativa"],
+                "meta_planilha": r_fr["meta_planilha"],
+                "alertas": r_fr["alertas"],
+            }
+        else:
+            erro_frentes = r_fr["erro"]
+    except Exception as e:
+        erro_frentes = f"{type(e).__name__}: {e}"
 
     # ── Pendências do pipe + alertas ──────────────────────────
     pend = montar_pendencias(abertos, users, so_do_dono=PENDENCIAS_DONO)
 
     alertas = []
+    if erro_frentes:
+        alertas.append("Não consegui montar a quebra por frente agora — " + erro_frentes)
+    for a in ((resumo_frentes or {}).get("alertas") or []):
+        alertas.append(a)
     if not closers_meta and not META_FIXA:
         alertas.append(
             "Nenhum closer com Subarea = " + "/".join(sorted(subareas))
@@ -1225,8 +1260,9 @@ def calcular_navigator(mes=None, ano=None):
             "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
             "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
             "mes": reu_mes,
+            "futuras": reu_futuras,
             "conversao": reunioes.get("conversao") or {
-                "deals_com_reuniao": 0, "deals_ganhos": 0, "taxa": 0.0},
+                "deals_com_reuniao": 0, "deals_ganhos": 0, "taxa": None},
             "lista_hoje":  (reunioes.get("detalhe") or {}).get(hoje_str, []),
             "lista_ontem": (reunioes.get("detalhe") or {}).get(ontem_str, []),
             "excluidos": EXCLUIR_REU,
@@ -1252,6 +1288,8 @@ def calcular_navigator(mes=None, ano=None):
         },
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
+        "detalhe_futuro": b_futuro,          # forecast de hoje em diante
+        "frentes": resumo_frentes,           # as 3 frentes, embutidas aqui
         "meta_composicao": sorted(closers_meta, key=lambda x: -x["meta"]),
         "pendencias": pend,
         "alertas": alertas,
@@ -2071,6 +2109,26 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard .sub{font-size:11px;color:var(--muted);margin-top:3px}
   .kcard.hoje{border-left-color:#1E3A8A;background:var(--blue-bg)}
   .kcard.ontem{border-left-color:var(--muted)}
+  .kcard.futuro{border-left-color:#7A8CA8;background:#FBFCFE}
+  .kcard.forte{border-left-width:4px}
+  .kcard .val.pos{color:var(--green)}
+  .kcard .val.neg{color:var(--red)}
+
+  /* BLOCOS — uma linha por assunto */
+  .bloco{margin-bottom:18px}
+  .bloco-tit{font-size:10px;font-weight:800;color:var(--navy);letter-spacing:1.2px;
+             text-transform:uppercase;display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .bloco-tit::before{content:'';width:3px;height:11px;background:var(--gold);border-radius:2px}
+  .bloco-tit .qd{font-weight:600;color:var(--muted);letter-spacing:.3px;text-transform:none;font-size:11px}
+  .bloco-tit .rule{flex:1;height:1px;background:var(--border)}
+  .bloco .cards{margin-bottom:0;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+  .bloco .cards.c2{max-width:calc(50% - 6px)}
+  .bloco .cards.c3{max-width:calc(75% - 3px)}
+  @media (max-width:1100px){
+    .bloco .cards{grid-template-columns:repeat(2,1fr)}
+    .bloco .cards.c2,.bloco .cards.c3{max-width:100%}
+  }
+  @media (max-width:560px){ .bloco .cards{grid-template-columns:1fr} }
 
   .btn-det{float:right;background:transparent;border:1px solid var(--border);border-radius:4px;
            color:var(--muted);font-size:9px;font-weight:700;padding:2px 7px;cursor:pointer;
@@ -2209,7 +2267,6 @@ PAGINA_HTML = r"""<!DOCTYPE html>
 
 <div class="tabs">
   <div class="tab on" id="tab-mes"    onclick="setView('mes')">Painel do Mês</div>
-  <div class="tab"    id="tab-resumo" onclick="setView('resumo')">Resumo — 3 Frentes</div>
   <div class="tab"    id="tab-graficos" onclick="setView('graficos')">Gráficos</div>
   <div class="tab"    id="tab-forecast" onclick="setView('forecast')">Forecast</div>
 </div>
@@ -2218,11 +2275,6 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   <div class="view on" id="view-mes">
     <div id="conteudo">
       <div class="card"><div class="loading"><div class="spinner"></div>Buscando dados…</div></div>
-    </div>
-  </div>
-  <div class="view" id="view-resumo">
-    <div id="conteudo-resumo">
-      <div class="card"><div class="loading"><div class="spinner"></div>Carregando resumo…</div></div>
     </div>
   </div>
   <div class="view" id="view-graficos">
@@ -2294,100 +2346,146 @@ function render(d){
 
   // ── respostas rápidas: ontem e hoje ──
   const reu = d.reunioes || {hoje:{}, ontem:{}};
-  const dh = d.detalhe_hoje || {};
   const cFunis = d.composicao || {};
   const sem = d.semana || {};
   const rmes = reu.mes || {agendadas:0, realizadas:0};
-  const conv = reu.conversao || {deals_com_reuniao:0, deals_ganhos:0, taxa:0};
-  const respostas = `
-    <div class="cards">
-      <div class="kcard ontem">
-        <div class="rot">Reuniões — Último DU
-          <button class="btn-det" onclick="verReunioes('ontem')">Detalhamento</button></div>
-        <div class="val">${N(reu.ontem.realizadas || 0)}</div>
-        <div class="sub">validadas de ${N(reu.ontem.agendadas || 0)} agendadas · ${p.ontem}</div>
-      </div>
-      <div class="kcard ontem">
-        <div class="rot">Vendas — Último DU</div>
-        <div class="val">${R(m.entrou_ontem_multi)}</div>
-        <div class="sub">c/ multiplicador · bruto ${R(m.entrou_ontem_bruto)}</div>
-      </div>
-      <div class="kcard hoje">
-        <div class="rot">Reuniões — Hoje
-          <button class="btn-det" onclick="verReunioes('hoje')">Detalhamento</button></div>
-        <div class="val">${N(reu.hoje.agendadas || 0)}</div>
-        <div class="sub">agendadas · ${N(reu.hoje.realizadas || 0)} já validadas</div>
-      </div>
-      <div class="kcard hoje">
-        <div class="rot">Vendas — Hoje</div>
-        <div class="val">${R(m.entrou_hoje_multi)}</div>
-        <div class="sub">c/ multiplicador · bruto ${R(m.entrou_hoje_bruto)}</div>
-      </div>
-    </div>
-    <div id="det-reunioes"></div>
-    <div class="cards">
-      <div class="kcard hoje"><div class="rot">Pipe 70% — Hoje</div>
-        <div class="val">${R(dh.p70 || 0)}</div><div class="sub">pondera ${R((dh.p70||0)*0.7)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 50% — Hoje</div>
-        <div class="val">${R(dh.p50 || 0)}</div><div class="sub">pondera ${R((dh.p50||0)*0.5)}</div></div>
-      <div class="kcard hoje"><div class="rot">Pipe 20% — Hoje</div>
-        <div class="val">${R(dh.p20 || 0)}</div><div class="sub">pondera ${R((dh.p20||0)*0.2)}</div></div>
-      <div class="kcard"><div class="rot">Previsto Hoje</div>
-        <div class="val">${R(m.previsto_hoje)}</div>
-        <div class="sub">de ${R(m.em_aberto_hoje)} em aberto (${dh.qtd || 0} negócios)${
-          cFunis.etapa_previsao ? ` · só negócios em Negociação` : ''}</div></div>
+  const rfut = reu.futuras || {agendadas:0, dias:0};
+  const conv = reu.conversao || {deals_com_reuniao:0, deals_ganhos:0, taxa:null};
+  const df = d.detalhe_futuro || {};
+  const gapCls = m.gap_100 > 0 ? 'neg' : 'pos';
+
+  const bloco = (titulo, quando, cards) => {
+    const n = (cards.match(/class="kcard/g) || []).length;
+    return `
+    <div class="bloco">
+      <div class="bloco-tit">${titulo}${quando ? `<span class="qd">${quando}</span>` : ''}
+        <div class="rule"></div></div>
+      <div class="cards${n === 2 ? ' c2' : n === 3 ? ' c3' : ''}">${cards}</div>
+    </div>`;
+  };
+
+  const card = (cls, rot, val, sub, extra='') => `
+    <div class="kcard ${cls}">
+      <div class="rot">${rot}${extra}</div>
+      <div class="val">${val}</div>
+      <div class="sub">${sub}</div>
     </div>`;
 
-  const gapCls   = m.gap_100 > 0 ? 'neg' : 'pos';
-  const devHint  = `(${P(m.pct_mes_decorrido)} do mês)`;
+  const det = q => `<button class="btn-det" onclick="verReunioes('${q}')">Detalhamento</button>`;
+
+  // 1 ── REUNIÕES
+  const bReunioes = bloco('Reuniões', `regra: negócio de ${esc(reu.dono || DONO_REU)}`,
+    card('ontem', 'Último dia útil', N(reu.ontem.realizadas || 0),
+         `validadas de ${N(reu.ontem.agendadas || 0)} agendadas · ${fmtDia(p.ontem)}`, det('ontem')) +
+    card('hoje', 'Hoje', N(reu.hoje.agendadas || 0),
+         `agendadas · ${N(reu.hoje.realizadas || 0)} já validadas`, det('hoje')) +
+    card('forte', 'Total do mês', N(rmes.realizadas || 0),
+         `validadas de ${N(rmes.agendadas || 0)} agendadas · conversão ${P(conv.taxa)}
+          (${N(conv.deals_ganhos || 0)}/${N(conv.deals_com_reuniao || 0)} negócios)`) +
+    card('futuro', 'Futuras', N(rfut.agendadas || 0),
+         `já na agenda depois de hoje · em ${N(rfut.dias || 0)} dia(s)`));
+
+  // 2 ── GANHO
+  const bGanho = bloco('Ganho', 'valores com multiplicador; o bruto vai no rodapé de cada card',
+    card('ontem', 'Último dia útil', R(m.entrou_ontem_multi),
+         `bruto ${R(m.entrou_ontem_bruto)} · ${fmtDia(p.ontem)}`) +
+    card('hoje', 'Hoje', R(m.entrou_hoje_multi),
+         `bruto ${R(m.entrou_hoje_bruto)}`) +
+    card('forte', 'Total do mês', R(m.real_multi),
+         `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${R(m.ticket_medio)}`) +
+    card('futuro', 'Previsto futuro', R(df.previsto || 0),
+         `ponderado do pipe de hoje em diante`));
+
+  // 3 ── FORECAST
+  const bForecast = bloco('Forecast', 'negócios em aberto com fechamento de hoje em diante',
+    card('futuro', 'Pipe 20%', R(df.p20 || 0), `pondera ${R((df.p20 || 0) * 0.2)}`) +
+    card('futuro', 'Pipe 50%', R(df.p50 || 0), `pondera ${R((df.p50 || 0) * 0.5)}`) +
+    card('futuro', 'Pipe 70%', R(df.p70 || 0), `pondera ${R((df.p70 || 0) * 0.7)}`) +
+    card('forte', 'Total ponderado', R(df.previsto || 0),
+         `de ${R(df.em_aberto || 0)} em aberto (${N(df.qtd || 0)} negócios)${
+           cFunis.etapa_previsao ? ' · só em Negociação' : ''}`));
+
+  // 4 ── VISÃO MÊS: onde estamos
+  const bVisao1 = bloco('Visão mês', `${N(p.du_passados)} de ${N(p.du_total)} dias úteis`,
+    card('', 'Meta do dia', R(m.meta_dia),
+         `meta do mês ${R(m.meta_mes)} ÷ ${N(p.du_total)} DU`) +
+    card('', 'Realizado', R(m.real_bruto), 'bruto, sem multiplicador') +
+    card('forte', 'Realizado c/ multiplicador', R(m.real_multi),
+         'é este que bate contra a meta') +
+    card('', 'MTD — deveria estar', R(m.deveria_mtd),
+         `${P(m.pct_mes_decorrido)} do mês decorrido`));
+
+  // 5 ── VISÃO MÊS: como estamos
+  const bVisao2 = bloco('Visão mês', 'atingimento e o que falta', `
+    <div class="kcard forte">
+      <div class="rot">Atingimento</div>
+      <div class="val ${m.atingimento >= 100 ? 'pos' : ''}">${P(m.atingimento)}</div>
+      <div class="sub">c/ multiplicador · bruto ${P(m.atingimento_bruto)}</div>
+    </div>
+    <div class="kcard forte">
+      <div class="rot">Gap 100%</div>
+      <div class="val ${gapCls}">${R(m.gap_100)}</div>
+      <div class="sub">${p.du_restantes > 0
+        ? `${R(m.meta_dia_100)}/dia nos ${N(p.du_restantes)} DU que faltam (bruto ${R(m.meta_dia_100_bruto)})`
+        : 'mês encerrado'}</div>
+    </div>`);
+
+  // 6 ── SEMANA
+  const bSemana = bloco('Semana',
+    sem.ini ? `${fmtDia(sem.ini)} a ${fmtDia(sem.fim)}` : '',
+    card('', 'Ganho', R(sem.entrou_bruto || 0), 'bruto') +
+    card('forte', 'Ganho c/ multiplicador', R(sem.entrou_multi || 0), 'é o que conta para a meta') +
+    card('', 'Volume', N(sem.qtd_vendas || 0), 'vendas fechadas na semana') +
+    card('futuro', 'Aberto na semana — ponderado', R(sem.previsto || 0),
+         `ponderado · 70% ${R((sem.p70||0)*0.7)} · 50% ${R((sem.p50||0)*0.5)} · 20% ${R((sem.p20||0)*0.2)}
+          <br>de ${R(sem.em_aberto || 0)} em aberto (${N(sem.qtd_abertos || 0)} negócios)`) +
+    card('', 'Reuniões', N(sem.reunioes_validadas || 0),
+         `validadas de ${N(sem.reunioes_agendadas || 0)} agendadas`));
 
   const notaComp = d.consolidado ? `
     <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
       ${R(cFunis.navigator?.valor || 0)} &nbsp;+&nbsp; <b>MGM</b> ${N(cFunis.mgm?.qtd || 0)} venda(s) ·
-      ${R(cFunis.mgm?.valor || 0)}. A separação por frente fica na aba Resumo.${
-        cFunis.etapa_previsao ? ` A previsão do dia considera só os ${N(cFunis.abertos_negociacao || 0)} negócios
+      ${R(cFunis.mgm?.valor || 0)}.${
+        cFunis.etapa_previsao ? ` Forecast e pipe consideram só os ${N(cFunis.abertos_negociacao || 0)} negócios
         na etapa <b>${esc(cFunis.etapa_previsao)}</b>, de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
 
-  const kpi = `
-  <div class="card">
-    <div class="table-scroll">
-      <table class="kpi">
-        <thead>
-          <tr><th>Métrica</th><th class="val">${(d.rotulo || d.funil || '').toUpperCase()}</th></tr>
-        </thead>
-        <tbody>
-          ${linha('Meta Mês',                 money(m.meta_mes,{forcar:1}), 'destaque')}
-          ${linha('Meta Dia',                 money(m.meta_dia,{forcar:1}))}
-          ${linha('Realizado Bruto',          money(m.real_bruto))}
-          ${linha('Realizado Multiplicador',  money(m.real_multi))}
-          ${linha('Deveria (100%) — MTD',     `${money(m.deveria_mtd,{forcar:1})} <span class="hint">${devHint}</span>`, 'sep')}
-          ${linha('Atingimento',              pctTag(m.atingimento), 'destaque', 'c/ multiplicador')}
-          ${linha('Gap 100%',                 `<span class="${gapCls}">${R(m.gap_100)}</span>`, '', 'c/ multiplicador')}
-          ${linha('Meta/Dia 100% (c/ Multiplicador)', money(m.meta_dia_100,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
-          ${linha('Meta/Dia 100% (Bruto)',            money(m.meta_dia_100_bruto,{forcar:1}), '', `÷ ${p.du_restantes} DU`)}
+  const blocos = bReunioes + `<div id="det-reunioes"></div>` +
+                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana + notaComp;
 
-          ${linha(`<b>Semana</b> <span class="hint">${sem.ini ? fmtDia(sem.ini) + ' a ' + fmtDia(sem.fim) : ''}</span>`, '', 'sep g-hoje destaque')}
-          ${linha('Entrou na Semana (Multiplicador)', money(sem.entrou_multi), 'g-hoje')}
-          ${linha('Entrou na Semana (Bruto)',         money(sem.entrou_bruto), 'g-hoje')}
-          ${linha('Vendas na Semana',                 N(sem.qtd_vendas || 0), 'g-hoje')}
-          ${linha('Previsto da Semana',               money(sem.previsto), 'g-hoje', 'soma dos ponderados abaixo')}
-          ${linha('Em Aberto na Semana',              `${money(sem.em_aberto)} <span class="hint">${N(sem.qtd_abertos || 0)} negócio(s)</span>`, 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 70%', `${money(sem.p70)} <span class="hint">pondera ${R((sem.p70||0)*0.7)}</span>`, 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 50%', `${money(sem.p50)} <span class="hint">pondera ${R((sem.p50||0)*0.5)}</span>`, 'g-hoje')}
-          ${linha('&nbsp;&nbsp;· Pipe 20%', `${money(sem.p20)} <span class="hint">pondera ${R((sem.p20||0)*0.2)}</span>`, 'g-hoje')}
-          ${linha('Reuniões na Semana',               `${N(sem.reunioes_validadas || 0)} <span class="hint">validadas de ${N(sem.reunioes_agendadas || 0)} agendadas</span>`, 'g-hoje')}
-          ${linha('Entrou Hoje (Multiplicador)',  money(m.entrou_hoje_multi), 'g-hoje')}
-          ${linha('Entrou Hoje (Bruto)',          money(m.entrou_hoje_bruto), 'g-hoje')}
-
-          ${linha('Reuniões Validadas no Mês', `${N(rmes.realizadas || 0)} <span class="hint">de ${N(rmes.agendadas || 0)} agendadas</span>`, 'sep')}
-          ${linha('Taxa de Conversão das Reuniões', pctTag(conv.taxa), 'destaque',
-                  `${N(conv.deals_ganhos || 0)} ganho(s) de ${N(conv.deals_com_reuniao || 0)} negócio(s) com reunião validada`)}
-          ${linha('Vendas no mês',  `${N(m.qtd_ganhos_mes)}`)}
-          ${linha('Ticket médio',   money(m.ticket_medio))}
-        </tbody>
-      </table>
-    </div>
-  </div>${notaComp}`;
+  // ── POR FRENTE (veio da antiga aba "Resumo — 3 Frentes") ──
+  let frentesHtml = '';
+  const fr = d.frentes;
+  if (fr && (fr.linhas || []).length) {
+    const linhaFr = (f, cls='') => `
+      <tr class="${cls}${(f.meta === 0 && f.real_multi === 0) ? ' zerada' : ''}">
+        <td>${esc(f.nome)}</td>
+        <td>${f.meta > 0 ? R(f.meta) : '<span class="zero">—</span>'}</td>
+        <td>${f.deveria_mtd > 0 ? R(f.deveria_mtd) : '<span class="zero">—</span>'}</td>
+        <td>${money(f.real_bruto)}</td>
+        <td>${money(f.real_multi)}</td>
+        <td>${pctTag(f.pct)}</td>
+        <td>${f.gap > 0 ? `<span class="neg">${R(f.gap)}</span>`
+                        : `<span class="pos">${R(Math.abs(f.gap))}</span>`}</td>
+        <td>${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</td>
+        <td>${N(f.qtd)}</td>
+        <td>${money(f.ticket)}</td>
+        <td>${money(f.pipe_aberto)}</td>
+      </tr>`;
+    frentesHtml = `
+      <div class="block-title">Por frente<div class="rule"></div></div>
+      <div class="card">
+        <div class="table-scroll">
+          <table class="frentes">
+            <thead><tr>
+              <th>Frente</th><th>Meta</th><th>Deveria (MTD)</th><th>Bruto</th>
+              <th>Multiplicador</th><th>% Ating.</th><th>Gap</th><th>Meta/Dia rest.</th>
+              <th>Vol.</th><th>Ticket</th><th>Pipe aberto</th>
+            </tr></thead>
+            <tbody>${fr.linhas.map(f => linhaFr(f)).join('')}${linhaFr(fr.total, 'total')}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
 
   // ── closers ──
   let closersHtml = '';
@@ -2536,7 +2634,7 @@ function render(d){
     : '';
 
   document.getElementById('conteudo').innerHTML =
-    `${respostas}<div class="block-title">Painel do Mês<div class="rule"></div></div>${kpi}${closersHtml}${sdrHtml}${pendHtml}${alertas}${comp}
+    `${blocos}${frentesHtml}${closersHtml}${sdrHtml}${pendHtml}${alertas}${comp}
      <div class="rodape">Funil ${d.funil} (pipeline ${d.pipeline_id}) · atualizado em ${p.atualizado_em}</div>`;
 }
 
@@ -2889,8 +2987,8 @@ async function carregarGraficos(){
 }
 
 // ── ABAS ──────────────────────────────────────────────────────
-const ABAS = ['mes','resumo','graficos','forecast'];
-let resumoCarregado = false, graficosCarregados = false, forecastCarregado = false;
+const ABAS = ['mes','graficos','forecast'];
+let graficosCarregados = false, forecastCarregado = false;
 
 // Atualiza as QUATRO abas de uma vez. É o que o botão Atualizar faz, e é o que
 // roda ao trocar o período. Não existe atualização automática por tempo.
@@ -2902,7 +3000,7 @@ async function atualizarTudo(){
   const rot = btn ? btn.textContent : '';
   if (btn) { btn.textContent = 'Atualizando…'; btn.disabled = true; }
   try {
-    await Promise.all([carregar(), carregarResumo(), carregarGraficos(), carregarForecast()]);
+    await Promise.all([carregar(), carregarGraficos(), carregarForecast()]);
   } finally {
     if (btn) { btn.textContent = rot || 'Atualizar'; btn.disabled = false; }
     atualizando = false;
@@ -2920,81 +3018,8 @@ function setView(v){
   // rede de segurança: se a carga dessa aba falhou, tenta de novo ao abrir.
   // Durante o boot/refresh geral não faz nada — atualizarTudo() já está buscando.
   if (!iniciado || atualizando) return;
-  if (v === 'resumo'   && !resumoCarregado)    carregarResumo();
   if (v === 'graficos' && !graficosCarregados) carregarGraficos();
   if (v === 'forecast' && !forecastCarregado)  carregarForecast();
-}
-
-// ── RESUMO DAS 3 FRENTES ──────────────────────────────────────
-function renderResumo(d){
-  const p = d.periodo;
-  const linhaFrente = (f, cls='') => `
-    <tr class="${cls}${(f.meta === 0 && f.real_multi === 0) ? ' zerada' : ''}">
-      <td>${esc(f.nome)}</td>
-      <td>${f.meta > 0 ? R(f.meta) : '<span class="zero">—</span>'}</td>
-      <td>${f.deveria_mtd > 0 ? R(f.deveria_mtd) : '<span class="zero">—</span>'}</td>
-      <td>${money(f.real_bruto)}</td>
-      <td>${money(f.real_multi)}</td>
-      <td>${pctTag(f.pct)}</td>
-      <td>${f.meta > 0 ? `<span class="${f.gap > 0 ? 'neg' : 'pos'}">${R(f.gap)}</span>` : '<span class="zero">—</span>'}</td>
-      <td>${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</td>
-      <td>${N(f.qtd)}</td>
-      <td>${money(f.pipe_aberto)}</td>
-      <td>${money(f.previsto_hoje)}</td>
-    </tr>`;
-
-
-  const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
-
-  document.getElementById('conteudo-resumo').innerHTML = `
-    <div class="cards">
-      <div class="kcard"><div class="rot">Meta do Mês</div><div class="val">${R(d.total.meta)}</div>
-        <div class="sub">três frentes somadas</div></div>
-      <div class="kcard"><div class="rot">Realizado</div><div class="val">${R(d.total.real_multi)}</div>
-        <div class="sub">c/ multiplicador · bruto ${R(d.total.real_bruto)}</div></div>
-      <div class="kcard"><div class="rot">Atingimento</div><div class="val">${P(d.total.pct)}</div>
-        <div class="sub">deveria estar em ${R(d.total.deveria_mtd)}</div></div>
-      <div class="kcard"><div class="rot">Falta por dia</div><div class="val">${R(d.total.meta_dia_rest)}</div>
-        <div class="sub">nos ${p.du_restantes} DU restantes</div></div>
-    </div>
-
-    <div class="block-title">Por frente — ${MESES[p.mes-1]} ${p.ano}<div class="rule"></div>
-      ${d.etapa_previsao ? `<span class="peso-nota">pipe e previsto: só etapa ${esc(d.etapa_previsao)}</span>` : ''}
-    </div>
-    <div class="card"><div class="table-scroll">
-      <table class="frentes">
-        <thead><tr>
-          <th>Frente</th><th>Meta</th><th>Deveria (MTD)</th><th>Bruto</th><th>Multiplicador</th>
-          <th>% Ating.</th><th>Gap</th><th>Falta/Dia</th><th>Vol.</th>
-          <th>Pipe em Negociação</th><th>Previsto Hoje</th>
-        </tr></thead>
-        <tbody>
-          ${d.frentes.map(f => linhaFrente(f)).join('')}
-          ${linhaFrente(d.total, 'total')}
-        </tbody>
-      </table>
-    </div></div>
-
-    ${alertas}
-    <div class="rodape">Atualizado em ${p.atualizado_em} · ${p.du_passados}/${p.du_total} dias úteis</div>`;
-}
-
-async function carregarResumo(){
-  document.getElementById('conteudo-resumo').innerHTML =
-    '<div class="card"><div class="loading"><div class="spinner"></div>Carregando resumo…</div></div>';
-  try {
-    const q = new URLSearchParams({fmt:'resumo',
-      mes: document.getElementById('sel-mes').value,
-      ano: document.getElementById('sel-ano').value});
-    if (KEY) q.set('k', KEY);
-    const data = await (await fetch('/api/index?' + q)).json();
-    if (data.erro) throw new Error(data.erro);
-    renderResumo(data);
-    resumoCarregado = true;
-  } catch(e) {
-    document.getElementById('conteudo-resumo').innerHTML =
-      `<div class="card"><div class="erro">Erro: ${esc(e.message)}</div></div>`;
-  }
 }
 
 // ── FORECAST DIA A DIA ────────────────────────────────────────
