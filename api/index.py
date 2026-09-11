@@ -1762,8 +1762,24 @@ PAGINA_HTML = r"""<!DOCTYPE html>
         box-shadow:var(--shadow);padding:16px 18px 10px;margin-bottom:20px}
   .graf-tit{font-size:13px;font-weight:700;color:var(--navy);margin-bottom:2px}
   .graf-sub{font-size:11px;color:var(--muted);margin-bottom:12px}
-  .graf-box{position:relative;height:290px}
-  .graf-box.alto{height:330px}
+  .graf-box{position:relative;height:320px}
+  .graf-box.alto{height:360px}
+
+  /* janelinha com o total do mês, dentro do gráfico */
+  .graf-total{position:absolute;top:2px;left:4px;z-index:3;pointer-events:none;
+              background:rgba(255,255,255,.93);border:1px solid var(--border);
+              border-radius:6px;padding:6px 10px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .graf-total .gt-rot{font-size:9px;font-weight:700;color:var(--muted);
+                      letter-spacing:.6px;text-transform:uppercase;line-height:1.2}
+  .graf-total .gt-val{font-size:17px;font-weight:800;color:var(--navy);line-height:1.15;margin-top:1px}
+  .graf-total .gt-pct{font-size:11px;font-weight:700;color:var(--muted)}
+  .graf-total .gt-sub{font-size:10px;color:var(--muted);line-height:1.3;margin-top:3px}
+  .graf-total .gt-pos{color:#0D7A3E;font-weight:700}
+  .graf-total .gt-neg{color:#B42318;font-weight:700}
+  /* variante do jacaré: MTD + atingimento lado a lado */
+  .graf-total .gt-cols{display:flex;gap:18px}
+  .graf-total .gt-cols .gt-val{font-size:15px}
+  .graf-total .gt-cols .gt-col+.gt-col{border-left:1px solid var(--border);padding-left:18px;margin-left:0}
 
   /* ABAS */
   .tabs{background:var(--white);border-bottom:1px solid var(--border);padding:0 24px;display:flex}
@@ -2316,12 +2332,69 @@ function detalheDoDia(dados, idx, apenasValidadas){
 
 const kCurto = v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : String(Math.round(v));  // cabe dentro da barra
 
+// ── janelinha de total do mês, desenhada por cima do gráfico ───
+const CURTO_FRENTE = { navigator: 'Ascensão', mgm: 'MGM', renovacao: 'Renovação' };
+
+function somaSerie(mapa, fr){
+  const partes = fr.map(f => ({
+    chave: f.chave,
+    nome: CURTO_FRENTE[f.chave] || f.nome,
+    v: ((mapa || {})[f.chave] || []).reduce((a, b) => a + (Number(b) || 0), 0)
+  }));
+  return { tot: partes.reduce((a, p) => a + p.v, 0), partes };
+}
+
+function caixaTotal(rotulo, mapa, fr, fmt){
+  const s = somaSerie(mapa, fr);
+  const quebra = s.partes.filter(p => p.v > 0).map(p =>
+    `<span style="color:${COR_FRENTE[p.chave] || '#6B7280'}">●</span> ${esc(p.nome)} <b>${fmt(p.v)}</b>`
+  ).join(' &nbsp;·&nbsp; ') || 'nada registrado no mês';
+  return `<div class="graf-total">
+      <div class="gt-rot">${esc(rotulo)}</div>
+      <div class="gt-val">${fmt(s.tot)}</div>
+      <div class="gt-sub">${quebra}</div>
+    </div>`;
+}
+
+function caixaJacare(d){
+  const j = d.jacare || [];
+  let iUlt = -1;
+  for (let i = 0; i < j.length; i++) if (j[i].real_mtd != null) iUlt = i;
+  const real     = iUlt >= 0 ? Number(j[iUlt].real_mtd || 0) : 0;
+  const metaHoje = iUlt >= 0 ? Number(j[iUlt].meta_mtd || 0) : 0;
+  const metaMes  = Number(d.periodo.meta_mes || 0);
+  const gap      = real - metaHoje;
+  const pctMes   = metaMes  ? (real / metaMes)  * 100 : null;   // atingimento da meta cheia
+  const pctMtd   = metaHoje ? (real / metaHoje) * 100 : null;   // atingimento do ritmo (MTD)
+  const cls      = gap >= 0 ? 'gt-pos' : 'gt-neg';
+  const sinal    = gap >= 0 ? '+' : '−';
+  return `<div class="graf-total">
+      <div class="gt-cols">
+        <div class="gt-col">
+          <div class="gt-rot">Realizado MTD</div>
+          <div class="gt-val">${R(real)}</div>
+        </div>
+        <div class="gt-col">
+          <div class="gt-rot">Meta MTD</div>
+          <div class="gt-val">${R(metaHoje)}</div>
+        </div>
+        <div class="gt-col">
+          <div class="gt-rot">Ating. MTD</div>
+          <div class="gt-val ${cls}">${P(pctMtd)}</div>
+        </div>
+      </div>
+      <div class="gt-sub"><span class="${cls}">${sinal}${R(Math.abs(gap))}</span> vs. ritmo de hoje
+        &nbsp;·&nbsp; meta do mês ${R(metaMes)} (<b>${P(pctMes)}</b> atingido)</div>
+    </div>`;
+}
+
 function baseEmpilhado(rotulos, series, opts){
   return {
     type: 'bar',
     data: { labels: rotulos.map(diaCurto), datasets: series },
     options: {
       responsive: true, maintainAspectRatio: false,
+      layout: { padding: { top: 42 } },   // espaço para a janelinha de total
       interaction: { mode: 'index', intersect: false },
       scales: {
         x: { stacked: true, grid: { display: false },
@@ -2374,27 +2447,31 @@ function renderGraficos(d){
       <div class="graf-tit">Reuniões agendadas por dia</div>
       <div class="graf-sub">Tudo que estava na agenda, empilhado por frente ·
         passe o mouse na barra para ver os negócios</div>
-      <div class="graf-box"><canvas id="g-agendadas"></canvas></div>
+      <div class="graf-box"><canvas id="g-agendadas"></canvas>
+        ${caixaTotal('Agendadas no mês', d.agendadas, fr, v => N(v))}</div>
     </div>
 
     <div class="graf">
       <div class="graf-tit">Reuniões validadas por dia</div>
       <div class="graf-sub">O subconjunto que passou na régua de validação ·
         passe o mouse na barra para ver os negócios</div>
-      <div class="graf-box"><canvas id="g-reunioes"></canvas></div>
+      <div class="graf-box"><canvas id="g-reunioes"></canvas>
+        ${caixaTotal('Validadas no mês', d.reunioes, fr, v => N(v))}</div>
     </div>
 
     <div class="graf">
       <div class="graf-tit">Vendas por dia</div>
       <div class="graf-sub">Valor bruto das vendas, empilhado por frente</div>
-      <div class="graf-box"><canvas id="g-vendas"></canvas></div>
+      <div class="graf-box"><canvas id="g-vendas"></canvas>
+        ${caixaTotal('Vendas brutas no mês', d.vendas, fr, v => R(v))}</div>
     </div>
 
     <div class="graf">
       <div class="graf-tit">Meta x Realizado acumulado</div>
       <div class="graf-sub">Meta de ${R(d.periodo.meta_mes)} distribuída pelos ${N(d.periodo.du_total)} dias úteis,
         contra o realizado acumulado (com multiplicador)</div>
-      <div class="graf-box alto"><canvas id="g-jacare"></canvas></div>
+      <div class="graf-box alto"><canvas id="g-jacare"></canvas>
+        ${caixaJacare(d)}</div>
     </div>
     ${alertas}
     <div class="rodape">Atualizado em ${d.periodo.atualizado_em}</div>`;
@@ -2451,6 +2528,7 @@ function renderGraficos(d){
     },
     options: {
       responsive: true, maintainAspectRatio: false,
+      layout: { padding: { top: 42 } },   // espaço para a janelinha de total
       interaction: { mode: 'index', intersect: false },
       scales: {
         x: { grid: { display: false },
