@@ -1369,6 +1369,163 @@ def calcular_resumo(mes=None, ano=None):
     }
 
 
+
+# ── ABA GRÁFICOS ──────────────────────────────────────────────
+def calcular_graficos(mes=None, ano=None):
+    """
+    Séries diárias para a aba Gráficos:
+      · reuniões por dia, separadas por frente
+      · vendas brutas por dia, separadas por frente
+      · jacaré: meta acumulada (linear por dia útil) x realizado acumulado
+      · atingimento por frente
+
+    A frente de uma REUNIÃO vem do negócio vinculado: funil MGM -> mgm;
+    funil Navigator -> renovacao se tiver a tag, senão navigator.
+    """
+    import calendar as cal_mod
+
+    hoje = hoje_br()
+    mes = mes or hoje.month
+    ano = ano or hoje.year
+    hoje_str = hoje.strftime("%Y-%m-%d")
+
+    feriados = buscar_feriados()
+    metas_sheet = buscar_metas(ano, mes)
+    colab = buscar_colaboradores(mes, ano)
+    subareas = _subareas()
+
+    # meta consolidada do mês (mesma régua do Painel do Mês)
+    nome_to_sub = {c["nome_norm"]: norm(c["subarea"]) for c in colab}
+    meta_mes = 0.0
+    for m in metas_sheet:
+        nn = m["nome_norm"]
+        if not nn or nn in EXCLUIR_PESSOAS:
+            continue
+        if not (m["meta_reu"] == 0 and m["meta_fin"] > 0):
+            continue
+        if nome_to_sub.get(nn) not in subareas:
+            continue
+        meta_mes += m["meta_fin"]
+    if META_FIXA:
+        meta_mes = to_num_br(META_FIXA)
+
+    du_calc = du_mes_total(ano, mes, feriados)
+    du_sheet = next((m["dias_uteis"] for m in metas_sheet if m["dias_uteis"] > 0), 0)
+    du_total = du_sheet if du_sheet > 0 else du_calc
+
+    pipe = buscar_pipeline_id()
+    pid = pipe["id"]
+    if not pid:
+        return {"erro": f"Funil '{FUNIL_NOME}' não encontrado.",
+                "funis_disponiveis": pipe["todos"]}
+
+    users = buscar_users()
+    ganhos_nav = buscar_ganhos(mes, ano, pid)
+    abertos_nav = buscar_abertos(pid)
+    ganhos_mgm, abertos_mgm = [], []
+    erro_mgm = None
+    if PIPELINE_MGM:
+        try:
+            ganhos_mgm = buscar_ganhos(mes, ano, PIPELINE_MGM)
+            abertos_mgm = buscar_abertos(PIPELINE_MGM)
+        except Exception as e:
+            erro_mgm = f"{type(e).__name__}: {e}"
+
+    # negócio -> frente
+    frente_por_deal = {}
+    for d in ganhos_nav + abertos_nav:
+        frente_por_deal[d.get("id")] = "renovacao" if eh_renovacao(d) else "navigator"
+    for d in ganhos_mgm + abertos_mgm:
+        frente_por_deal[d.get("id")] = "mgm"
+
+    ultimo = cal_mod.monthrange(ano, mes)[1]
+    dias = [date(ano, mes, d).strftime("%Y-%m-%d") for d in range(1, ultimo + 1)]
+    chaves = ("navigator", "mgm", "renovacao")
+
+    # ── vendas brutas por dia, por frente ─────────────────────
+    vendas = {k: {d: 0.0 for d in dias} for k in chaves}
+    vendas_multi_dia = {d: 0.0 for d in dias}
+    for d in ganhos_nav + ganhos_mgm:
+        dia = won_time_br(d)[:10]
+        if dia not in vendas["navigator"]:
+            continue
+        f = frente_por_deal.get(d.get("id"), "navigator")
+        vendas[f][dia] += float(d.get("value") or 0)
+        vendas_multi_dia[dia] += float(cf(d, CF_MULTIPLICADOR) or 0)
+
+    # ── reuniões por dia, por frente ──────────────────────────
+    reunioes = {k: {d: 0 for d in dias} for k in chaves}
+    erro_reu = None
+    try:
+        r = contar_reunioes(mes, ano, users, dias,
+                            deals_extra=ganhos_nav + ganhos_mgm + abertos_nav + abertos_mgm)
+        for dia, itens in (r.get("detalhe") or {}).items():
+            if dia not in reunioes["navigator"]:
+                continue
+            for it in itens:
+                if it["status"] != "realizada":      # só o que virou reunião de fato
+                    continue
+                f = frente_por_deal.get(it.get("deal_id"))
+                if not f:
+                    f = "mgm" if (it.get("funil") or "").strip().upper() == "MGM" else "navigator"
+                reunioes[f][dia] += 1
+    except Exception as e:
+        erro_reu = f"{type(e).__name__}: {e}"
+
+    # ── jacaré: meta acumulada x realizado acumulado ──────────
+    meta_dia = safe_div(meta_mes, du_total)
+    jacare, acum_du, acum_real = [], 0, 0.0
+    for dia in dias:
+        dt = date(ano, mes, int(dia[8:10]))
+        if dt.weekday() < 5 and dt not in feriados:
+            acum_du += 1
+        acum_real += vendas_multi_dia[dia]
+        futuro = dia > hoje_str
+        jacare.append({
+            "dia": dia,
+            "meta_mtd": arred(min(meta_dia * acum_du, meta_mes)),
+            "real_mtd": None if futuro else arred(acum_real),
+            "e_du": dt.weekday() < 5 and dt not in feriados,
+        })
+
+    # ── atingimento por frente ────────────────────────────────
+    metas_frentes = METAS_FRENTES.get((ano, mes), {})
+    atingimento = []
+    for k in chaves:
+        meta_f = float(metas_frentes.get(k, 0))
+        bruto = sum(vendas[k].values())
+        deals_f = [d for d in ganhos_nav + ganhos_mgm
+                   if frente_por_deal.get(d.get("id")) == k]
+        multi = sum(float(cf(d, CF_MULTIPLICADOR) or 0) for d in deals_f)
+        atingimento.append({
+            "chave": k, "nome": NOMES_FRENTES[k],
+            "meta": arred(meta_f),
+            "bruto": arred(bruto), "multi": arred(multi),
+            "pct": arred(safe_div(multi, meta_f) * 100) if meta_f else None,
+            "vendas": len(deals_f),
+            "reunioes": sum(reunioes[k].values()),
+        })
+
+    alertas = []
+    if erro_mgm:
+        alertas.append("Não consegui ler o funil MGM agora — " + erro_mgm)
+    if erro_reu:
+        alertas.append("Não consegui montar a série de reuniões — " + erro_reu)
+
+    return {
+        "periodo": {"mes": mes, "ano": ano, "hoje": hoje_str,
+                    "du_total": du_total, "meta_mes": arred(meta_mes),
+                    "atualizado_em": agora_br().strftime("%d/%m/%Y %H:%M")},
+        "dias": dias,
+        "frentes": [{"chave": k, "nome": NOMES_FRENTES[k]} for k in chaves],
+        "reunioes": {k: [reunioes[k][d] for d in dias] for k in chaves},
+        "vendas":   {k: [arred(vendas[k][d]) for d in dias] for k in chaves},
+        "jacare": jacare,
+        "atingimento": atingimento,
+        "alertas": alertas,
+    }
+
+
 # ── AUTH OPCIONAL ─────────────────────────────────────────────
 def autorizado():
     if not PAINEL_SENHA:
@@ -1416,6 +1573,8 @@ def roteador(p):
         return health_payload()
     if modo == "resumo" or alvo.endswith("resumo"):
         return _handler(calcular_resumo)
+    if modo == "graficos" or alvo.endswith("graficos"):
+        return _handler(calcular_graficos)
     if modo == "json" or alvo.endswith("navigator"):
         return _handler()
     return Response(PAGINA_HTML, mimetype="text/html; charset=utf-8")
@@ -1550,6 +1709,13 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .rodape{text-align:right;color:var(--muted);font-size:11px;font-style:italic;margin-top:14px}
 
 
+  .graf{background:var(--white);border:1px solid var(--border);border-radius:8px;
+        box-shadow:var(--shadow);padding:16px 18px 10px;margin-bottom:20px}
+  .graf-tit{font-size:13px;font-weight:700;color:var(--navy);margin-bottom:2px}
+  .graf-sub{font-size:11px;color:var(--muted);margin-bottom:12px}
+  .graf-box{position:relative;height:290px}
+  .graf-box.alto{height:330px}
+
   /* ABAS */
   .tabs{background:var(--white);border-bottom:1px solid var(--border);padding:0 24px;display:flex}
   .tab{padding:12px 18px;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted);
@@ -1646,6 +1812,8 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .erro{padding:40px;text-align:center;color:var(--red);font-size:13px}
   .erro code{display:block;margin-top:10px;font-size:11px;color:var(--muted);white-space:pre-wrap;text-align:left}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
 </head>
 <body>
 
@@ -1661,8 +1829,8 @@ PAGINA_HTML = r"""<!DOCTYPE html>
     <div class="periodo-badge" id="periodo-badge">Carregando…</div>
   </div>
   <div class="header-right">
-    <select id="sel-mes" onchange="carregar(); if(resumoCarregado||document.getElementById('view-resumo').classList.contains('on')) carregarResumo();"></select>
-    <select id="sel-ano" onchange="carregar(); if(resumoCarregado||document.getElementById('view-resumo').classList.contains('on')) carregarResumo();"></select>
+    <select id="sel-mes" onchange="trocouPeriodo()"></select>
+    <select id="sel-ano" onchange="trocouPeriodo()"></select>
     <button class="btn-reload" onclick="carregar()">Atualizar</button>
     <span class="update-info" id="update-info"></span>
   </div>
@@ -1671,6 +1839,7 @@ PAGINA_HTML = r"""<!DOCTYPE html>
 <div class="tabs">
   <div class="tab on" id="tab-mes"    onclick="setView('mes')">Painel do Mês</div>
   <div class="tab"    id="tab-resumo" onclick="setView('resumo')">Resumo — 3 Frentes</div>
+  <div class="tab"    id="tab-graficos" onclick="setView('graficos')">Gráficos</div>
 </div>
 
 <div class="main">
@@ -1682,6 +1851,11 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   <div class="view" id="view-resumo">
     <div id="conteudo-resumo">
       <div class="card"><div class="loading"><div class="spinner"></div>Carregando resumo…</div></div>
+    </div>
+  </div>
+  <div class="view" id="view-graficos">
+    <div id="conteudo-graficos">
+      <div class="card"><div class="loading"><div class="spinner"></div>Carregando gráficos…</div></div>
     </div>
   </div>
 </div>
@@ -1989,7 +2163,7 @@ async function carregar(){
   document.getElementById('conteudo').innerHTML =
     '<div class="card"><div class="loading"><div class="spinner"></div>Buscando dados do Navigator…</div></div>';
   try {
-    resumoCarregado = false;
+    resumoCarregado = false; graficosCarregados = false;
     const mes = document.getElementById('sel-mes').value;
     const ano = document.getElementById('sel-ano').value;
     // /api/index é o path canônico da function na Vercel — sempre chega no Python.
@@ -2059,15 +2233,191 @@ function verReunioes(qual){
     </div>`;
 }
 
+// ── GRÁFICOS ──────────────────────────────────────────────────
+const COR_FRENTE = { navigator: '#1A1A2E', mgm: '#B8860B', renovacao: '#7A8CA8' };
+let CHARTS = {};
+
+function destroiCharts(){
+  Object.values(CHARTS).forEach(c => { try { c.destroy(); } catch(e){} });
+  CHARTS = {};
+}
+const diaCurto = s => s.slice(8,10) + '/' + s.slice(5,7);
+const kBRL  = v => v >= 1000 ? 'R$ ' + (v/1000).toFixed(0) + 'k' : 'R$ ' + Math.round(v);
+const kCurto = v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : String(Math.round(v));  // cabe dentro da barra
+
+function baseEmpilhado(rotulos, series, opts){
+  return {
+    type: 'bar',
+    data: { labels: rotulos.map(diaCurto), datasets: series },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { stacked: true, grid: { display: false },
+             ticks: { color: '#6B7280', font: { size: 9 }, maxRotation: 0, autoSkip: false } },
+        y: { stacked: true, beginAtZero: true,
+             grid: { color: 'rgba(0,0,0,.05)' },
+             ticks: { color: '#6B7280', font: { size: 10 }, callback: opts.tickY } }
+      },
+      plugins: {
+        legend: { position: 'top', align: 'end',
+          labels: { boxWidth: 12, boxHeight: 12, font: { size: 11, weight: '600' },
+                    color: '#374151', usePointStyle: true, pointStyle: 'rect' } },
+        tooltip: { backgroundColor: '#1A1A2E', padding: 10, cornerRadius: 6,
+          callbacks: { label: c => ' ' + c.dataset.label + ': ' + opts.fmt(c.parsed.y) } },
+        datalabels: {
+          color: '#fff', font: { size: 9, weight: '700' },
+          formatter: v => v > 0 ? opts.rotulo(v) : '',
+          display: ctx => ctx.dataset.data[ctx.dataIndex] > 0
+        }
+      }
+    },
+    plugins: [ChartDataLabels]
+  };
+}
+
+function renderGraficos(d){
+  destroiCharts();
+  const fr = d.frentes;
+  const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
+
+  const cardsAting = d.atingimento.map(a => `
+    <div class="kcard">
+      <div class="rot">${esc(a.nome)}</div>
+      <div class="val">${a.pct == null ? '—' : P(a.pct)}</div>
+      <div class="sub">${R(a.multi)} de ${R(a.meta)}<br>
+        ${N(a.vendas)} venda(s) · ${N(a.reunioes)} reunião(ões)</div>
+    </div>`).join('');
+
+  document.getElementById('conteudo-graficos').innerHTML = `
+    <div class="block-title">Atingimento por frente<div class="rule"></div></div>
+    <div class="cards">${cardsAting}</div>
+
+    <div class="graf">
+      <div class="graf-tit">Reuniões por dia</div>
+      <div class="graf-sub">Reuniões validadas, empilhadas por frente</div>
+      <div class="graf-box"><canvas id="g-reunioes"></canvas></div>
+    </div>
+
+    <div class="graf">
+      <div class="graf-tit">Vendas por dia</div>
+      <div class="graf-sub">Valor bruto das vendas, empilhado por frente</div>
+      <div class="graf-box"><canvas id="g-vendas"></canvas></div>
+    </div>
+
+    <div class="graf">
+      <div class="graf-tit">Meta x Realizado acumulado</div>
+      <div class="graf-sub">Meta de ${R(d.periodo.meta_mes)} distribuída pelos ${N(d.periodo.du_total)} dias úteis,
+        contra o realizado acumulado (com multiplicador)</div>
+      <div class="graf-box alto"><canvas id="g-jacare"></canvas></div>
+    </div>
+    ${alertas}
+    <div class="rodape">Atualizado em ${d.periodo.atualizado_em}</div>`;
+
+  if (typeof Chart === 'undefined') {
+    document.getElementById('conteudo-graficos').insertAdjacentHTML('afterbegin',
+      '<div class="alerta">⚠ Não consegui carregar a biblioteca de gráficos (Chart.js). Verifique a conexão.</div>');
+    return;
+  }
+
+  // 1 — reuniões
+  CHARTS.reu = new Chart(document.getElementById('g-reunioes'), baseEmpilhado(
+    d.dias,
+    fr.map(f => ({ label: f.nome, data: d.reunioes[f.chave],
+                   backgroundColor: COR_FRENTE[f.chave], borderWidth: 0,
+                   borderRadius: 2, maxBarThickness: 30 })),
+    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v) }
+  ));
+
+  // 2 — vendas brutas
+  CHARTS.ven = new Chart(document.getElementById('g-vendas'), baseEmpilhado(
+    d.dias,
+    fr.map(f => ({ label: f.nome, data: d.vendas[f.chave],
+                   backgroundColor: COR_FRENTE[f.chave], borderWidth: 0,
+                   borderRadius: 2, maxBarThickness: 30 })),
+    { fmt: v => R(v), rotulo: v => kCurto(v), tickY: v => kBRL(v) }
+  ));
+
+  // 3 — jacaré
+  CHARTS.jac = new Chart(document.getElementById('g-jacare'), {
+    type: 'line',
+    data: {
+      labels: d.jacare.map(j => diaCurto(j.dia)),
+      datasets: [
+        { label: 'Meta acumulada', data: d.jacare.map(j => j.meta_mtd),
+          borderColor: '#B8860B', borderWidth: 2, borderDash: [5,4],
+          pointRadius: 0, pointHoverRadius: 5, tension: 0, fill: false, order: 2 },
+        { label: 'Realizado acumulado', data: d.jacare.map(j => j.real_mtd),
+          borderColor: '#1A1A2E', borderWidth: 2.5, pointRadius: 0, pointHoverRadius: 6,
+          tension: 0.15, spanGaps: false, order: 1,
+          fill: { target: 0, above: 'rgba(13,122,62,.10)', below: 'rgba(160,160,170,.14)' } }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { grid: { display: false },
+             ticks: { color: '#6B7280', font: { size: 9 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 16 } },
+        y: { beginAtZero: true, grid: { color: 'rgba(0,0,0,.05)' },
+             ticks: { color: '#6B7280', font: { size: 10 }, callback: v => kBRL(v) } }
+      },
+      plugins: {
+        datalabels: { display: false },
+        legend: { position: 'top', align: 'end',
+          labels: { boxWidth: 20, boxHeight: 2, font: { size: 11, weight: '600' },
+                    color: '#374151', usePointStyle: true, pointStyle: 'line' } },
+        tooltip: { backgroundColor: '#1A1A2E', padding: 12, cornerRadius: 6,
+          callbacks: {
+            label: c => ' ' + c.dataset.label + ': ' + (c.parsed.y == null ? '—' : R(c.parsed.y)),
+            footer: items => {
+              const meta = items.find(i => i.datasetIndex === 0);
+              const real = items.find(i => i.datasetIndex === 1);
+              if (!meta || !real || real.parsed.y == null || !meta.parsed.y) return '';
+              const g = real.parsed.y - meta.parsed.y;
+              return (g >= 0 ? 'Acima da meta em ' : 'Abaixo da meta em ') + R(Math.abs(g));
+            }
+          } }
+      }
+    },
+    plugins: [ChartDataLabels]
+  });
+}
+
+async function carregarGraficos(){
+  document.getElementById('conteudo-graficos').innerHTML =
+    '<div class="card"><div class="loading"><div class="spinner"></div>Carregando gráficos…</div></div>';
+  try {
+    const q = new URLSearchParams({fmt:'graficos',
+      mes: document.getElementById('sel-mes').value,
+      ano: document.getElementById('sel-ano').value});
+    if (KEY) q.set('k', KEY);
+    const data = await (await fetch('/api/index?' + q)).json();
+    if (data.erro) throw new Error(data.erro);
+    renderGraficos(data);
+    graficosCarregados = true;
+  } catch(e) {
+    document.getElementById('conteudo-graficos').innerHTML =
+      `<div class="card"><div class="erro">Erro: ${esc(e.message)}</div></div>`;
+  }
+}
+
 // ── ABAS ──────────────────────────────────────────────────────
-let resumoCarregado = false;
+let resumoCarregado = false, graficosCarregados = false;
+function trocouPeriodo(){
+  carregar();
+  if (document.getElementById('view-resumo').classList.contains('on'))   carregarResumo();
+  if (document.getElementById('view-graficos').classList.contains('on')) carregarGraficos();
+}
+
 function setView(v){
-  ['mes','resumo'].forEach(k => {
+  ['mes','resumo','graficos'].forEach(k => {
     document.getElementById('view-' + k).classList.toggle('on', k === v);
     document.getElementById('tab-' + k).classList.toggle('on', k === v);
   });
-  location.hash = v === 'resumo' ? '#resumo' : '';
-  if (v === 'resumo' && !resumoCarregado) carregarResumo();
+  location.hash = v === 'mes' ? '' : '#' + v;
+  if (v === 'resumo'   && !resumoCarregado)    carregarResumo();
+  if (v === 'graficos' && !graficosCarregados) carregarGraficos();
 }
 
 // ── RESUMO DAS 3 FRENTES ──────────────────────────────────────
@@ -2144,7 +2494,10 @@ async function carregarResumo(){
 
 carregar();
 if (location.hash === '#resumo') setView('resumo');
-setInterval(() => { carregar(); if (resumoCarregado) carregarResumo(); }, 5 * 60 * 1000);
+if (location.hash === '#graficos') setView('graficos');
+setInterval(() => { carregar();
+  if (resumoCarregado) carregarResumo();
+  if (graficosCarregados) carregarGraficos(); }, 5 * 60 * 1000);
 </script>
 </body>
 </html>
