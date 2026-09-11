@@ -1454,21 +1454,34 @@ def calcular_graficos(mes=None, ano=None):
         vendas_multi_dia[dia] += float(cf(d, CF_MULTIPLICADOR) or 0)
 
     # ── reuniões por dia, por frente ──────────────────────────
-    reunioes = {k: {d: 0 for d in dias} for k in chaves}
+    # agendadas = tudo que estava na agenda; validadas = o subconjunto que passou na régua
+    agendadas = {k: {d: 0 for d in dias} for k in chaves}
+    reunioes  = {k: {d: 0 for d in dias} for k in chaves}
+    titulos   = {d: [] for d in dias}          # para o tooltip do gráfico
     erro_reu = None
     try:
         r = contar_reunioes(mes, ano, users, dias,
                             deals_extra=ganhos_nav + ganhos_mgm + abertos_nav + abertos_mgm)
         for dia, itens in (r.get("detalhe") or {}).items():
-            if dia not in reunioes["navigator"]:
+            if dia not in agendadas["navigator"]:
                 continue
             for it in itens:
-                if it["status"] != "realizada":      # só o que virou reunião de fato
-                    continue
                 f = frente_por_deal.get(it.get("deal_id"))
                 if not f:
                     f = "mgm" if (it.get("funil") or "").strip().upper() == "MGM" else "navigator"
-                reunioes[f][dia] += 1
+                agendadas[f][dia] += 1
+                if it["status"] == "realizada":
+                    reunioes[f][dia] += 1
+                nome_resp = (it.get("responsavel") or "").split(" ")[0]
+                titulos[dia].append({
+                    "t": (it.get("deal") or it.get("assunto") or "(sem título)")[:60],
+                    "r": nome_resp,
+                    "f": f,
+                    "s": it["status"],
+                    "h": it.get("hora"),
+                })
+        for d in titulos:
+            titulos[d].sort(key=lambda x: (x["h"] or "99:99"))
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
 
@@ -1504,6 +1517,7 @@ def calcular_graficos(mes=None, ano=None):
             "pct": arred(safe_div(multi, meta_f) * 100) if meta_f else None,
             "vendas": len(deals_f),
             "reunioes": sum(reunioes[k].values()),
+            "agendadas": sum(agendadas[k].values()),
         })
 
     alertas = []
@@ -1518,7 +1532,9 @@ def calcular_graficos(mes=None, ano=None):
                     "atualizado_em": agora_br().strftime("%d/%m/%Y %H:%M")},
         "dias": dias,
         "frentes": [{"chave": k, "nome": NOMES_FRENTES[k]} for k in chaves],
+        "agendadas": {k: [agendadas[k][d] for d in dias] for k in chaves},
         "reunioes": {k: [reunioes[k][d] for d in dias] for k in chaves},
+        "titulos": {d: titulos[d] for d in dias if titulos[d]},
         "vendas":   {k: [arred(vendas[k][d]) for d in dias] for k in chaves},
         "jacare": jacare,
         "atingimento": atingimento,
@@ -2243,6 +2259,22 @@ function destroiCharts(){
 }
 const diaCurto = s => s.slice(8,10) + '/' + s.slice(5,7);
 const kBRL  = v => v >= 1000 ? 'R$ ' + (v/1000).toFixed(0) + 'k' : 'R$ ' + Math.round(v);
+const ST_CURTO = { realizada: 'validada', nao_validada: 'não validada', pendente: 'pendente' };
+
+// lista de reuniões do dia para o rodapé do tooltip
+function detalheDoDia(dados, idx, apenasValidadas){
+  const dia = dados.dias[idx];
+  let itens = (dados.titulos || {})[dia] || [];
+  if (apenasValidadas) itens = itens.filter(i => i.s === 'realizada');
+  if (!itens.length) return '';
+  const LIM = 8;
+  const linhas = itens.slice(0, LIM).map(i =>
+    `${i.h || '--:--'}  ${i.t}${i.r ? '  · ' + i.r : ''}` +
+    (apenasValidadas ? '' : `  [${ST_CURTO[i.s] || i.s}]`));
+  if (itens.length > LIM) linhas.push(`+ ${itens.length - LIM} outra(s)`);
+  return linhas;
+}
+
 const kCurto = v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : String(Math.round(v));  // cabe dentro da barra
 
 function baseEmpilhado(rotulos, series, opts){
@@ -2263,8 +2295,14 @@ function baseEmpilhado(rotulos, series, opts){
         legend: { position: 'top', align: 'end',
           labels: { boxWidth: 12, boxHeight: 12, font: { size: 11, weight: '600' },
                     color: '#374151', usePointStyle: true, pointStyle: 'rect' } },
-        tooltip: { backgroundColor: '#1A1A2E', padding: 10, cornerRadius: 6,
-          callbacks: { label: c => ' ' + c.dataset.label + ': ' + opts.fmt(c.parsed.y) } },
+        tooltip: { backgroundColor: '#1A1A2E', padding: 11, cornerRadius: 6,
+          titleFont: { size: 12 }, bodyFont: { size: 11.5 }, footerFont: { size: 11, weight: '400' },
+          bodySpacing: 3, footerMarginTop: 8, footerColor: '#C9CBD6', boxPadding: 3,
+          filter: item => item.parsed.y > 0,
+          callbacks: {
+            label: c => ' ' + c.dataset.label + ': ' + opts.fmt(c.parsed.y),
+            footer: items => opts.detalhe ? opts.detalhe(items[0].dataIndex) : ''
+          } },
         datalabels: {
           color: '#fff', font: { size: 9, weight: '700' },
           formatter: v => v > 0 ? opts.rotulo(v) : '',
@@ -2286,7 +2324,7 @@ function renderGraficos(d){
       <div class="rot">${esc(a.nome)}</div>
       <div class="val">${a.pct == null ? '—' : P(a.pct)}</div>
       <div class="sub">${R(a.multi)} de ${R(a.meta)}<br>
-        ${N(a.vendas)} venda(s) · ${N(a.reunioes)} reunião(ões)</div>
+        ${N(a.vendas)} venda(s) · ${N(a.reunioes)} de ${N(a.agendadas)} reuniões validadas</div>
     </div>`).join('');
 
   document.getElementById('conteudo-graficos').innerHTML = `
@@ -2294,8 +2332,16 @@ function renderGraficos(d){
     <div class="cards">${cardsAting}</div>
 
     <div class="graf">
-      <div class="graf-tit">Reuniões por dia</div>
-      <div class="graf-sub">Reuniões validadas, empilhadas por frente</div>
+      <div class="graf-tit">Reuniões agendadas por dia</div>
+      <div class="graf-sub">Tudo que estava na agenda, empilhado por frente ·
+        passe o mouse na barra para ver os negócios</div>
+      <div class="graf-box"><canvas id="g-agendadas"></canvas></div>
+    </div>
+
+    <div class="graf">
+      <div class="graf-tit">Reuniões validadas por dia</div>
+      <div class="graf-sub">O subconjunto que passou na régua de validação ·
+        passe o mouse na barra para ver os negócios</div>
       <div class="graf-box"><canvas id="g-reunioes"></canvas></div>
     </div>
 
@@ -2320,16 +2366,27 @@ function renderGraficos(d){
     return;
   }
 
-  // 1 — reuniões
+  // 1 — reuniões agendadas
+  CHARTS.age = new Chart(document.getElementById('g-agendadas'), baseEmpilhado(
+    d.dias,
+    fr.map(f => ({ label: f.nome, data: d.agendadas[f.chave],
+                   backgroundColor: COR_FRENTE[f.chave], borderWidth: 0,
+                   borderRadius: 2, maxBarThickness: 30 })),
+    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v),
+      detalhe: i => detalheDoDia(d, i, false) }
+  ));
+
+  // 2 — reuniões validadas
   CHARTS.reu = new Chart(document.getElementById('g-reunioes'), baseEmpilhado(
     d.dias,
     fr.map(f => ({ label: f.nome, data: d.reunioes[f.chave],
                    backgroundColor: COR_FRENTE[f.chave], borderWidth: 0,
                    borderRadius: 2, maxBarThickness: 30 })),
-    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v) }
+    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v),
+      detalhe: i => detalheDoDia(d, i, true) }
   ));
 
-  // 2 — vendas brutas
+  // 3 — vendas brutas
   CHARTS.ven = new Chart(document.getElementById('g-vendas'), baseEmpilhado(
     d.dias,
     fr.map(f => ({ label: f.nome, data: d.vendas[f.chave],
@@ -2338,7 +2395,7 @@ function renderGraficos(d){
     { fmt: v => R(v), rotulo: v => kCurto(v), tickY: v => kBRL(v) }
   ));
 
-  // 3 — jacaré
+  // 4 — jacaré
   CHARTS.jac = new Chart(document.getElementById('g-jacare'), {
     type: 'line',
     data: {
