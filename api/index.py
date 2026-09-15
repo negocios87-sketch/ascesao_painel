@@ -1256,10 +1256,27 @@ def calcular_navigator(mes=None, ano=None):
     g_ontem_equipe  = por_dia_equipe.get(ontem_str, dict(ZERO))
 
     # ── Métricas do painel ────────────────────────────────────
-    meta_dia = safe_div(meta_mes, du_total)
+    meta_dia = safe_div(meta_mes, du_total)          # estática: meta / DU do mês
     deveria_mtd = meta_dia * du_pass
     gap_100 = meta_mes - real_multi
     gap_100_bruto = meta_mes - real_bruto
+
+    # DU que ainda dá para cumprir, CONTANDO HOJE.
+    # du_passados() já inclui hoje, então du_rest = só de amanhã em diante — dividir
+    # o gap por ele joga a meta de hoje para os outros dias e infla o número.
+    hoje_e_du = hoje.weekday() < 5 and hoje not in feriados
+    if mes_fechado:
+        du_com_hoje = 0
+    elif mes_futuro:
+        du_com_hoje = du_total
+    else:
+        du_com_hoje = du_rest + (1 if hoje_e_du else 0)
+
+    # Meta do dia AJUSTADA: o que falta, espalhado pelos dias que sobraram.
+    # Se ontem ficou 10k para trás, esses 10k já estão dentro do gap e voltam
+    # diluídos aqui — é a "meta que corre atrás" que o Rodrigo pediu.
+    meta_dia_ajust       = safe_div(gap_100, du_com_hoje) if du_com_hoje else 0.0
+    meta_dia_ajust_bruto = safe_div(gap_100_bruto, du_com_hoje) if du_com_hoje else 0.0
 
     metricas = {
         "meta_mes":           arred(meta_mes),
@@ -1271,8 +1288,12 @@ def calcular_navigator(mes=None, ano=None):
         "atingimento":        arred(safe_div(real_multi, meta_mes) * 100),
         "atingimento_bruto":  arred(safe_div(real_bruto, meta_mes) * 100),
         "gap_100":            arred(gap_100),
-        "meta_dia_100":       arred(safe_div(gap_100, du_rest)) if du_rest else 0.0,
-        "meta_dia_100_bruto": arred(safe_div(gap_100_bruto, du_rest)) if du_rest else 0.0,
+        "du_com_hoje":        du_com_hoje,
+        "hoje_e_du":          hoje_e_du,
+        "meta_dia_ajust":       arred(meta_dia_ajust),
+        "meta_dia_ajust_bruto": arred(meta_dia_ajust_bruto),
+        "meta_dia_100":       arred(meta_dia_ajust),          # compat: mesmo número
+        "meta_dia_100_bruto": arred(meta_dia_ajust_bruto),
         "previsto_ontem":     b_ontem["previsto"],
         "entrou_ontem_multi": arred(g_ontem["multi"]),
         "entrou_ontem_bruto": arred(g_ontem["bruto"]),
@@ -1289,7 +1310,8 @@ def calcular_navigator(mes=None, ano=None):
         "atingimento_equipe":        arred(safe_div(real_multi_equipe, meta_mes) * 100),
         "atingimento_bruto_equipe":  arred(safe_div(real_bruto_equipe, meta_mes) * 100),
         "gap_100_equipe":            arred(meta_mes - real_multi_equipe),
-        "meta_dia_100_equipe":       arred(safe_div(meta_mes - real_multi_equipe, du_rest)) if du_rest else 0.0,
+        "meta_dia_ajust_equipe":     arred(safe_div(meta_mes - real_multi_equipe, du_com_hoje)) if du_com_hoje else 0.0,
+        "meta_dia_100_equipe":       arred(safe_div(meta_mes - real_multi_equipe, du_com_hoje)) if du_com_hoje else 0.0,
         "entrou_ontem_multi_equipe": arred(g_ontem_equipe["multi"]),
         "entrou_ontem_bruto_equipe": arred(g_ontem_equipe["bruto"]),
         "entrou_hoje_multi_equipe":  arred(g_hoje_equipe["multi"]),
@@ -1421,6 +1443,26 @@ def calcular_navigator(mes=None, ano=None):
                 so_tag += 1
         abertos_ref = [d for d in abertos_todos if eh_referido(d)]
         ganhos_ref = [d for d in ganhos if eh_referido(d)]
+
+        ST_DEAL = {"won": "Ganho", "lost": "Perdido", "open": "Aberto"}
+        itens_ref = []
+        for d in refs:
+            po, pt = motivo_referido(d)
+            org = cf(d, CF_ORIGEM)
+            itens_ref.append({
+                "id": d.get("id"),
+                "titulo": d.get("title") or "(sem título)",
+                "dono": owner_name(d, users) or "— sem dono —",
+                "valor": arred(float(d.get("value") or 0)),
+                "status": ST_DEAL.get(d.get("status"), d.get("status") or "—"),
+                "criado": add_time_br(d)[:10],
+                "funil": (buscar_pipelines_mapa() or {}).get(d.get("pipeline_id")) or "—",
+                "origem": (org.get("label") if isinstance(org, dict) else org) or "—",
+                "por": ("origem + tag" if (po and pt) else "origem" if po else "tag"),
+                "url": f"https://boardacademy.pipedrive.com/deal/{d.get('id')}",
+            })
+        ordem_st = {"Ganho": 0, "Aberto": 1, "Perdido": 2}
+        itens_ref.sort(key=lambda x: (ordem_st.get(x["status"], 9), -x["valor"]))
         referidos = {
             "no_mes": len(refs),
             "criados_no_mes": len(criados),
@@ -1431,6 +1473,7 @@ def calcular_navigator(mes=None, ano=None):
             "em_aberto": len(abertos_ref),
             "ganhos_no_mes": len(ganhos_ref),
             "regra": {"origem": ORIGEM_REFERIDO, "tag": TAG_REFERIDO_VALOR},
+            "itens": itens_ref,
         }
     except Exception as e:
         erro_ref = f"{type(e).__name__}: {e}"
@@ -2684,8 +2727,12 @@ function render(d){
 
   // 4 ── VISÃO MÊS: onde estamos
   const bVisao1 = bloco('Visão mês', `${N(p.du_passados)} de ${N(p.du_total)} dias úteis`,
-    card('', 'Meta do dia', R(m.meta_dia),
-         `meta do mês ${R(m.meta_mes)} ÷ ${N(p.du_total)} DU`) +
+    card('forte', 'Meta do dia', R(m.meta_dia_ajust),
+         m.du_com_hoje > 0
+           ? `${R(m.gap_100)} que faltam ÷ ${N(m.du_com_hoje)} DU restantes${
+               m.hoje_e_du ? ' (contando hoje)' : ''}<br>` +
+             `<span class="gt-eq">meta linear era ${R(m.meta_dia)}</span>`
+           : 'mês encerrado') +
     card('', 'Realizado', R(m.real_bruto), 'bruto, sem multiplicador' +
          soEq(m.real_bruto_equipe !== m.real_bruto ? R(m.real_bruto_equipe) : '')) +
     card('forte', 'Realizado c/ multiplicador', R(m.real_multi),
@@ -2707,8 +2754,8 @@ function render(d){
     <div class="kcard forte">
       <div class="rot">Gap 100%</div>
       <div class="val ${gapCls}">${R(m.gap_100)}</div>
-      <div class="sub">${p.du_restantes > 0
-        ? `${R(m.meta_dia_100)}/dia nos ${N(p.du_restantes)} DU que faltam`
+      <div class="sub">${m.du_com_hoje > 0
+        ? `${R(m.meta_dia_ajust)}/dia nos ${N(m.du_com_hoje)} DU restantes`
         : 'mês encerrado'}${
         temRecorte ? `<br><span class="gt-eq">equipe: ${R(m.gap_100_equipe)}</span>` : ''}</div>
     </div>`);
@@ -2736,7 +2783,8 @@ function render(d){
     `Origem contém "${esc(rf.regra.origem)}" ou tag "${esc(rf.regra.tag)}"`,
     card('forte', 'Indicados no mês', N(rf.no_mes),
          `de ${N(rf.criados_no_mes)} negócio(s) criados no mês${
-           rf.pct_do_mes == null ? '' : ` · ${P(rf.pct_do_mes)} da entrada`}`) +
+           rf.pct_do_mes == null ? '' : ` · ${P(rf.pct_do_mes)} da entrada`}`,
+         (rf.itens || []).length ? `<button class="btn-det" onclick="verReferidos()">Ver lista</button>` : '') +
     card('', 'Por Origem', N(rf.por_origem),
          `campo Origem com "${esc(rf.regra.origem)}"`) +
     card('', 'Por tag', N(rf.por_tag),
@@ -2753,7 +2801,8 @@ function render(d){
         de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
 
   const blocos = bReunioes + `<div id="det-reunioes"></div>` +
-                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana + bReferidos + notaComp;
+                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana +
+                 bReferidos + `<div id="det-referidos"></div>` + notaComp;
 
   // ── POR FRENTE (veio da antiga aba "Resumo — 3 Frentes") ──
   let frentesHtml = '';
@@ -3027,6 +3076,51 @@ function verReunioes(qual){
         ${dup > 0 ? `<br><b>${dup}</b> atividade(s) duplicada(s) no mesmo negócio foram ocultadas — no Pipedrive existe mais de uma para o mesmo negócio neste dia.` : ''}
         ${r.fora_escopo > 0 ? `<br><b>${r.fora_escopo}</b> reunião(ões) do mês ficaram de fora por estarem em funil que não é Navigator nem MGM.` : ''}
         ${r.fora_dono > 0 ? `<br><b>${r.fora_dono}</b> reunião(ões) do mês ficaram de fora por serem em negócio de outra pessoa.` : ''}
+      </div>
+    </div>`;
+}
+
+// ── LISTA DE INDICAÇÕES ───────────────────────────────────────
+function verReferidos(){
+  const box = document.getElementById('det-referidos');
+  if (!box || !dadosPainel || !dadosPainel.referidos) return;
+  if (box.dataset.aberto === '1') { box.innerHTML = ''; box.dataset.aberto = ''; return; }
+  box.dataset.aberto = '1';
+
+  const rf = dadosPainel.referidos;
+  const itens = rf.itens || [];
+  const ST = {Ganho:'realizada', Aberto:'pendente', Perdido:'nao_validada'};
+
+  const linhas = itens.map(i => `
+    <tr>
+      <td class="hora">${fmtDia(i.criado)}</td>
+      <td><a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)} ↗</a></td>
+      <td>${esc(i.dono)}</td>
+      <td>${esc(i.funil)}</td>
+      <td>${esc(i.origem)}</td>
+      <td><span class="fr fr-${i.por === 'tag' ? 'renovacao' : 'mgm'}">${esc(i.por)}</span></td>
+      <td class="num">${i.valor ? R(i.valor) : '<span class="zero">—</span>'}</td>
+      <td><span class="st st-${ST[i.status] || 'pendente'}">${esc(i.status)}</span></td>
+    </tr>`).join('');
+
+  box.innerHTML = `
+    <div class="det-box det">
+      <div class="det-head">
+        <span class="t">Indicações do mês · ${itens.length} negócio(s)</span>
+        <button class="x" onclick="verReferidos()">fechar</button>
+      </div>
+      ${itens.length ? `
+        <table>
+          <thead><tr>
+            <th>Criado</th><th>Negócio</th><th>Dono</th><th>Funil</th>
+            <th>Origem</th><th>Entrou por</th><th class="num">Valor</th><th>Status</th>
+          </tr></thead>
+          <tbody>${linhas}</tbody>
+        </table>` : '<div class="det-vazio">Nenhuma indicação registrada no mês.</div>'}
+      <div class="det-nota">
+        Entra quem tem Origem contendo <b>${esc(rf.regra.origem)}</b> ou a tag
+        <b>${esc(rf.regra.tag)}</b>. A data é a de criação do negócio, então a lista é
+        de quem <b>entrou</b> no mês — inclusive os já perdidos.
       </div>
     </div>`;
 }
