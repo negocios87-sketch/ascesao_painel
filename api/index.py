@@ -428,6 +428,61 @@ def buscar_abertos(pipeline_id):
 
 
 
+def add_time_br(deal):
+    """add_time do Pipedrive vem em UTC; o painel raciocina em BRT."""
+    raw = str(deal.get("add_time") or "")
+    if not raw:
+        return ""
+    txt = raw.replace("T", " ").replace("Z", "")[:19]
+    try:
+        return (datetime.strptime(txt, "%Y-%m-%d %H:%M:%S")
+                - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return txt
+
+
+def buscar_criados_mes(mes, ano, pipeline_id):
+    """
+    Negócios CRIADOS no mês, em qualquer status (aberto, ganho ou perdido).
+
+    Ordena por add_time DESC e para assim que passa do mês alvo — mesma técnica
+    de buscar_ganhos, para não varrer o funil inteiro. É o que permite contar
+    indicações sem perder as que já foram marcadas como perdidas.
+    """
+    def _fetch():
+        mes_str = f"{ano}-{mes:02d}"
+        todos, start = [], 0
+        while True:
+            r = req.get(f"{BASE_V1}/deals", params={
+                "pipeline_id": pipeline_id,
+                "status": "all_not_deleted",
+                "sort": "add_time DESC",
+                "limit": 500,
+                "start": start,
+                "api_token": API_KEY,
+            }, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            lote = data.get("data") or []
+            achou_antigo = False
+            for d in lote:
+                if d.get("pipeline_id") != pipeline_id:
+                    continue
+                at = add_time_br(d)[:7]
+                if at == mes_str:
+                    todos.append(d)
+                elif at and at < mes_str:
+                    achou_antigo = True
+            mais = (data.get("additional_data", {})
+                        .get("pagination", {})
+                        .get("more_items_in_collection", False))
+            if not mais or not lote or achou_antigo:
+                break
+            start += 500
+        return todos
+    return cached(f"criados:{pipeline_id}:{ano}-{mes}", 300, _fetch)
+
+
 def buscar_pipelines_mapa():
     """Mapa pipeline_id -> nome do funil."""
     def _fetch():
@@ -729,9 +784,19 @@ TAG_RENOVACAO_CAMPO = os.environ.get(
     "TAG_RENOVACAO_CAMPO", "54fc9258843cdf7ea126b6c5aca9d4dc93a3a718")
 TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "Renovacao_IC")
 
+# ── REFERIDOS (indicações) ────────────────────────────────────
+# Um negócio é referido se a Origem contém "buzzlead" OU a tag v2 traz
+# "indicacao-comercial". As duas regras são OU, não E.
+CF_ORIGEM          = os.environ.get("CF_ORIGEM", "58cb059ade38e20702c892ee413f24e38c52d327")
+ORIGEM_REFERIDO    = os.environ.get("ORIGEM_REFERIDO", "buzzlead")
+CF_TAG_REFERIDO    = os.environ.get("CF_TAG_REFERIDO", TAG_RENOVACAO_CAMPO)
+TAG_REFERIDO_VALOR = os.environ.get("TAG_REFERIDO_VALOR", "indicacao-comercial")
+
 # Só negócios nesta etapa entram na previsão (20/50/70) e no pipe do dia.
 # Casa por trecho do nome, então "Negocia" pega "Negociação" em qualquer funil.
-ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia")
+# Etapas que entram no forecast. Aceita lista separada por vírgula; cada item é
+# casado por "contém" no nome da etapa (sem acento, sem case).
+ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia,Inscrição em Andamento")
 
 # Metas por frente e por mês.
 # Set/26 revisado para 500k: os 40k a mais entraram no Navigator (300k -> 340k),
@@ -772,24 +837,85 @@ def valores_tag_renovacao():
     return cached("tag_renov", 900, _fetch)
 
 
+SEPARADORES_TAG = (",", "|", ";")
+
+
+def tags_do_campo(deal, campo):
+    """
+    Devolve o conjunto de tags de um campo, normalizadas.
+
+    O campo de tag do Pipedrive vem como UMA string com tudo junto
+    ("Inativo, aplicacao-pfcc, Renovacao_IC, ..."), então comparar o valor
+    inteiro nunca casa quando o negócio tem mais de uma tag. Aqui a string é
+    quebrada nos separadores e cada pedaço vira um item.
+    Também aceita lista, dict {id,label} e valor solto.
+    """
+    val = cf(deal, campo)
+    if val is None:
+        return set()
+
+    def pedacos(v):
+        if isinstance(v, dict):
+            out = set()
+            if v.get("id") is not None:
+                out.add(str(v.get("id")))
+            if v.get("label"):
+                out.add(norm(v.get("label")))
+            return out
+        txt = str(v)
+        for sep in SEPARADORES_TAG[1:]:
+            txt = txt.replace(sep, SEPARADORES_TAG[0])
+        return {norm(t) for t in txt.split(SEPARADORES_TAG[0]) if norm(t)} | {str(v).strip()}
+
+    if isinstance(val, list):
+        out = set()
+        for v in val:
+            out |= pedacos(v)
+        return out
+    return pedacos(val)
+
+
 def eh_renovacao(deal):
     """True se o negócio carrega a tag de Renovação."""
     if not TAG_RENOVACAO_CAMPO or not TAG_RENOVACAO_VALOR:
         return False
-    val = cf(deal, TAG_RENOVACAO_CAMPO)
-    if val is None:
-        return False
-    aceitos = valores_tag_renovacao()
+    return bool(tags_do_campo(deal, TAG_RENOVACAO_CAMPO) & valores_tag_renovacao())
 
-    def bate(v):
-        if isinstance(v, dict):
-            return (str(v.get("id")) in aceitos
-                    or norm(str(v.get("label", ""))) in aceitos)
-        return str(v).strip() in aceitos or norm(str(v)) in aceitos
 
-    if isinstance(val, list):
-        return any(bate(v) for v in val)
-    return bate(val)
+def eh_referido(deal):
+    """
+    True se o negócio veio de indicação. Duas portas de entrada, em OU:
+      · Origem contém "buzzlead"  (campo de texto, casamento por "contém")
+      · tag v2 contém "indicacao-comercial"  (casamento por item da lista)
+    """
+    alvo_origem = norm(ORIGEM_REFERIDO)
+    if alvo_origem and CF_ORIGEM:
+        origem = cf(deal, CF_ORIGEM)
+        if origem is not None:
+            txt = origem.get("label", "") if isinstance(origem, dict) else origem
+            if alvo_origem in norm(txt):
+                return True
+
+    alvo_tag = norm(TAG_REFERIDO_VALOR)
+    if alvo_tag and CF_TAG_REFERIDO:
+        if alvo_tag in tags_do_campo(deal, CF_TAG_REFERIDO):
+            return True
+    return False
+
+
+def motivo_referido(deal):
+    """Por qual das duas regras o negócio entrou — para a quebra do bloco."""
+    por_origem = por_tag = False
+    alvo_origem = norm(ORIGEM_REFERIDO)
+    if alvo_origem and CF_ORIGEM:
+        origem = cf(deal, CF_ORIGEM)
+        if origem is not None:
+            txt = origem.get("label", "") if isinstance(origem, dict) else origem
+            por_origem = alvo_origem in norm(txt)
+    alvo_tag = norm(TAG_REFERIDO_VALOR)
+    if alvo_tag and CF_TAG_REFERIDO:
+        por_tag = alvo_tag in tags_do_campo(deal, CF_TAG_REFERIDO)
+    return por_origem, por_tag
 
 
 def buscar_stages_mapa():
@@ -802,13 +928,28 @@ def buscar_stages_mapa():
     return cached("stages", 3600, _fetch)
 
 
+def termos_previsao():
+    """ETAPA_PREVISAO quebrada em termos normalizados."""
+    return [t for t in (norm(x) for x in ETAPA_PREVISAO.split(",")) if t]
+
+
 def stages_previsao():
     """Ids das etapas que contam para a previsão. None = filtro desligado."""
-    alvo = norm(ETAPA_PREVISAO)
-    if not alvo:
+    alvos = termos_previsao()
+    if not alvos:
         return None
-    ids = {sid for sid, nome in buscar_stages_mapa().items() if alvo in norm(nome)}
+    ids = {sid for sid, nome in buscar_stages_mapa().items()
+           if any(a in norm(nome) for a in alvos)}
     return ids or None          # nenhuma etapa casou: não filtra nada
+
+
+def nomes_etapas_previsao(pipelines=()):
+    """Nomes das etapas que o filtro pegou, para o painel poder mostrar quais são."""
+    ids = stages_previsao()
+    if not ids:
+        return []
+    mapa = buscar_stages_mapa()
+    return sorted({mapa[i] for i in ids if i in mapa})
 
 
 def so_em_negociacao(deals):
@@ -1195,6 +1336,38 @@ def calcular_navigator(mes=None, ano=None):
         "dias": sum(1 for d in dias_depois if (cont_reu.get(d) or {}).get("agendadas", 0)),
     }
 
+    # ── Referidos: só volume, é a pergunta "quantos indicados tivemos" ──
+    referidos, erro_ref = None, None
+    try:
+        criados = buscar_criados_mes(mes, ano, pid)
+        if PIPELINE_MGM:
+            criados = criados + buscar_criados_mes(mes, ano, PIPELINE_MGM)
+        refs = [d for d in criados if eh_referido(d)]
+        so_origem = so_tag = ambos = 0
+        for d in refs:
+            po, pt = motivo_referido(d)
+            if po and pt:
+                ambos += 1
+            elif po:
+                so_origem += 1
+            else:
+                so_tag += 1
+        abertos_ref = [d for d in abertos_todos if eh_referido(d)]
+        ganhos_ref = [d for d in ganhos if eh_referido(d)]
+        referidos = {
+            "no_mes": len(refs),
+            "criados_no_mes": len(criados),
+            "pct_do_mes": arred(safe_div(len(refs), len(criados)) * 100) if criados else None,
+            "por_origem": so_origem + ambos,
+            "por_tag": so_tag + ambos,
+            "por_ambos": ambos,
+            "em_aberto": len(abertos_ref),
+            "ganhos_no_mes": len(ganhos_ref),
+            "regra": {"origem": ORIGEM_REFERIDO, "tag": TAG_REFERIDO_VALOR},
+        }
+    except Exception as e:
+        erro_ref = f"{type(e).__name__}: {e}"
+
     # ── As 3 frentes, embutidas no Painel do Mês ──────────────
     # (a aba "Resumo — 3 Frentes" deixou de existir; o cálculo é o mesmo e as
     #  chamadas ao Pipedrive estão em cache, então não custa requisição extra)
@@ -1219,6 +1392,8 @@ def calcular_navigator(mes=None, ano=None):
     alertas = []
     if erro_frentes:
         alertas.append("Não consegui montar a quebra por frente agora — " + erro_frentes)
+    if erro_ref:
+        alertas.append("Não consegui contar os referidos agora — " + erro_ref)
     for a in ((resumo_frentes or {}).get("alertas") or []):
         alertas.append(a)
     if not closers_meta and not META_FIXA:
@@ -1290,6 +1465,8 @@ def calcular_navigator(mes=None, ano=None):
         "detalhe_ontem": b_ontem,
         "detalhe_futuro": b_futuro,          # forecast de hoje em diante
         "frentes": resumo_frentes,           # as 3 frentes, embutidas aqui
+        "referidos": referidos,
+        "etapas_previsao": nomes_etapas_previsao(),
         "meta_composicao": sorted(closers_meta, key=lambda x: -x["meta"]),
         "pendencias": pend,
         "alertas": alertas,
@@ -2233,6 +2410,18 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .fc-aviso{padding:12px 16px;font-size:12px;color:var(--text);background:var(--amber-bg);
             border-bottom:1px solid #F0D9A8}
   .fc-vazio{padding:18px;text-align:center;color:var(--muted);font-size:12px}
+  .fc-range{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--white);
+            border:1px solid var(--border);border-radius:8px;padding:12px 16px;
+            box-shadow:var(--shadow);margin-bottom:12px}
+  .fc-range label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;
+                  letter-spacing:.6px;display:flex;align-items:center;gap:7px}
+  .fc-range input[type=date]{font-family:inherit;font-size:12px;font-weight:600;color:var(--navy);
+            border:1px solid var(--border);border-radius:5px;padding:5px 8px;background:var(--white)}
+  .fc-range input[type=date]:focus{outline:none;border-color:var(--gold)}
+  .fc-bt-range{background:transparent;border:1px solid var(--border);border-radius:5px;
+               color:var(--muted);font-size:10px;font-weight:700;padding:5px 10px;cursor:pointer;
+               text-transform:uppercase;letter-spacing:.4px;font-family:inherit;transition:all .15s}
+  .fc-bt-range:hover{border-color:var(--gold);color:var(--gold)}
 
   .loading{display:flex;align-items:center;justify-content:center;gap:12px;padding:60px;color:var(--muted)}
   .spinner{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--gold);
@@ -2442,15 +2631,30 @@ function render(d){
     card('', 'Reuniões', N(sem.reunioes_validadas || 0),
          `validadas de ${N(sem.reunioes_agendadas || 0)} agendadas`));
 
+  // 7 ── REFERIDOS (só volume: quantas pessoas foram indicadas)
+  const rf = d.referidos;
+  const bReferidos = !rf ? '' : bloco('Referidos',
+    `Origem contém "${esc(rf.regra.origem)}" ou tag "${esc(rf.regra.tag)}"`,
+    card('forte', 'Indicados no mês', N(rf.no_mes),
+         `de ${N(rf.criados_no_mes)} negócio(s) criados no mês${
+           rf.pct_do_mes == null ? '' : ` · ${P(rf.pct_do_mes)} da entrada`}`) +
+    card('', 'Por Origem', N(rf.por_origem),
+         `campo Origem com "${esc(rf.regra.origem)}"`) +
+    card('', 'Por tag', N(rf.por_tag),
+         `tag "${esc(rf.regra.tag)}"${rf.por_ambos ? ` · ${N(rf.por_ambos)} batem as duas` : ''}`) +
+    card('futuro', 'Indicados em aberto', N(rf.em_aberto),
+         `no pipe agora, de qualquer mês · ${N(rf.ganhos_no_mes)} ganho(s) no mês`));
+
   const notaComp = d.consolidado ? `
     <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
       ${R(cFunis.navigator?.valor || 0)} &nbsp;+&nbsp; <b>MGM</b> ${N(cFunis.mgm?.qtd || 0)} venda(s) ·
       ${R(cFunis.mgm?.valor || 0)}.${
         cFunis.etapa_previsao ? ` Forecast e pipe consideram só os ${N(cFunis.abertos_negociacao || 0)} negócios
-        na etapa <b>${esc(cFunis.etapa_previsao)}</b>, de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
+        nas etapas <b>${esc((d.etapas_previsao || []).join(' · ') || cFunis.etapa_previsao)}</b>,
+        de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
 
   const blocos = bReunioes + `<div id="det-reunioes"></div>` +
-                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana + notaComp;
+                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana + bReferidos + notaComp;
 
   // ── POR FRENTE (veio da antiga aba "Resumo — 3 Frentes") ──
   let frentesHtml = '';
@@ -3084,6 +3288,25 @@ function renderForecast(d){
           t.gap_projecao > 0 ? 'faltam ' + R(t.gap_projecao) : 'sobra ' + R(Math.abs(t.gap_projecao))}</span></div></div>
     </div>`;
 
+  // ── faixa do range: consolidados de um período escolhido à mão ──
+  const dias = d.linhas.map(l => l.dia);
+  const ini0 = FC_RANGE.ini && dias.includes(FC_RANGE.ini) ? FC_RANGE.ini : dias[0];
+  const fim0 = FC_RANGE.fim && dias.includes(FC_RANGE.fim) ? FC_RANGE.fim : dias[dias.length - 1];
+  FC_RANGE = { ini: ini0, fim: fim0 };
+
+  const faixaRange = `
+    <div class="block-title">Consolidado do período<div class="rule"></div></div>
+    <div class="fc-range">
+      <label>De <input type="date" id="fc-de" value="${ini0}" min="${dias[0]}" max="${dias[dias.length-1]}"
+             onchange="mudouRange()"></label>
+      <label>até <input type="date" id="fc-ate" value="${fim0}" min="${dias[0]}" max="${dias[dias.length-1]}"
+             onchange="mudouRange()"></label>
+      <button class="fc-bt-range" onclick="rangeAtalho('resto')">De hoje até o fim</button>
+      <button class="fc-bt-range" onclick="rangeAtalho('semana')">Próximos 7 dias</button>
+      <button class="fc-bt-range" onclick="rangeAtalho('mes')">Mês todo</button>
+    </div>
+    <div id="fc-cards-range"></div>`;
+
   const linhas = d.linhas.map((l, i) => {
     const vazio = l.qtd === 0 && l.ganho_qtd === 0;
     const cls = [l.hoje ? 'e-hoje' : '', l.passado ? 'passado' : '',
@@ -3134,6 +3357,7 @@ function renderForecast(d){
 
   document.getElementById('conteudo-forecast').innerHTML = `
     ${cards}
+    ${faixaRange}
     <div class="block-title">Forecast dia a dia — ${MESES[p.mes-1]} ${p.ano}<div class="rule"></div></div>
     <div class="card">
       <div class="table-scroll">
@@ -3165,6 +3389,72 @@ function renderForecast(d){
     </div>
     ${semData}${foraMes}${alertas}
     <div class="rodape">Atualizado em ${p.atualizado_em}</div>`;
+
+  renderCardsRange();
+}
+
+// ── consolidados do range ─────────────────────────────────────
+// Tudo calculado no navegador a partir das linhas que já vieram: mudar o range
+// não dispara chamada nenhuma ao Pipedrive.
+let FC_RANGE = { ini: null, fim: null };
+
+function mudouRange(){
+  const de  = document.getElementById('fc-de');
+  const ate = document.getElementById('fc-ate');
+  if (!de || !ate) return;
+  let a = de.value, b = ate.value;
+  if (a && b && a > b) { const t = a; a = b; b = t; de.value = a; ate.value = b; }
+  FC_RANGE = { ini: a, fim: b };
+  renderCardsRange();
+}
+
+function rangeAtalho(qual){
+  if (!dadosForecast) return;
+  const dias = dadosForecast.linhas.map(l => l.dia);
+  const hoje = dadosForecast.periodo.hoje;
+  let a = dias[0], b = dias[dias.length - 1];
+  if (qual === 'resto')  { a = dias.includes(hoje) ? hoje : dias[0]; }
+  if (qual === 'semana') {
+    a = dias.includes(hoje) ? hoje : dias[0];
+    const i = dias.indexOf(a);
+    b = dias[Math.min(i + 6, dias.length - 1)];
+  }
+  document.getElementById('fc-de').value  = a;
+  document.getElementById('fc-ate').value = b;
+  FC_RANGE = { ini: a, fim: b };
+  renderCardsRange();
+}
+
+function renderCardsRange(){
+  const box = document.getElementById('fc-cards-range');
+  if (!box || !dadosForecast) return;
+  const { ini, fim } = FC_RANGE;
+  const sel = dadosForecast.linhas.filter(l => l.dia >= ini && l.dia <= fim);
+  const soma = c => sel.reduce((a, l) => a + (l[c] || 0), 0);
+
+  const previsto = soma('previsto'), aberto = soma('em_aberto');
+  const p20 = soma('p20'), p50 = soma('p50'), p70 = soma('p70');
+  const semProb = soma('sem_probabilidade');
+  const entrou = soma('ganho_multi'), entrouQtd = soma('ganho_qtd');
+  const qtd = soma('qtd');
+  const du = sel.filter(l => l.e_du).length;
+
+  box.innerHTML = `
+    <div class="cards">
+      <div class="kcard forte"><div class="rot">Previsto no período</div>
+        <div class="val">${R(previsto)}</div>
+        <div class="sub">ponderado de ${R(aberto)} em aberto · ${N(qtd)} negócio(s)</div></div>
+      <div class="kcard futuro"><div class="rot">70% / 50% / 20%</div>
+        <div class="val">${R(p70)}</div>
+        <div class="sub">50% ${R(p50)} · 20% ${R(p20)}${
+          semProb ? `<br>${R(semProb)} sem probabilidade (fora do previsto)` : ''}</div></div>
+      <div class="kcard"><div class="rot">Entrou no período</div>
+        <div class="val">${R(entrou)}</div>
+        <div class="sub">c/ multiplicador · ${N(entrouQtd)} venda(s)</div></div>
+      <div class="kcard"><div class="rot">Período</div>
+        <div class="val">${N(sel.length)} dia(s)</div>
+        <div class="sub">${fmtDia(ini)} a ${fmtDia(fim)} · ${N(du)} dia(s) útil(eis)</div></div>
+    </div>`;
 }
 
 async function carregarForecast(){
