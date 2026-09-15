@@ -1183,19 +1183,45 @@ def calcular_navigator(mes=None, ano=None):
                 "abertos": len(abertos_mgm)},
     }
 
-    # ── Realizado ─────────────────────────────────────────────
-    real_bruto = sum(float(d.get("value") or 0) for d in ganhos)
-    real_multi = sum(float(cf(d, CF_MULTIPLICADOR) or 0) for d in ganhos)
+    # ── Realizado — DUAS RÉGUAS, lado a lado ──────────────────
+    # equipe = só quem está em CLOSERS (é contra isso que a meta da planilha fecha)
+    # funil  = todo ganho do Navigator + MGM, seja de quem for
+    lista_closers_norm = _lista_norm(CLOSERS_LISTA)
 
-    por_dia = {}
-    for d in ganhos:
-        dia = won_time_br(d)[:10]
-        if not dia:
-            continue
-        acc = por_dia.setdefault(dia, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
-        acc["bruto"] += float(d.get("value") or 0)
-        acc["multi"] += float(cf(d, CF_MULTIPLICADOR) or 0)
-        acc["qtd"] += 1
+    def da_equipe(d):
+        if not lista_closers_norm:
+            return True
+        return norm(owner_name(d, users)) in lista_closers_norm
+
+    ganhos_equipe = [d for d in ganhos if da_equipe(d)]
+
+    def soma_dia(lista):
+        acc_total = {"bruto": 0.0, "multi": 0.0, "qtd": 0}
+        dia_a_dia = {}
+        for d in lista:
+            v = float(d.get("value") or 0)
+            mv = float(cf(d, CF_MULTIPLICADOR) or 0)
+            acc_total["bruto"] += v
+            acc_total["multi"] += mv
+            acc_total["qtd"] += 1
+            dia = won_time_br(d)[:10]
+            if not dia:
+                continue
+            acc = dia_a_dia.setdefault(dia, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
+            acc["bruto"] += v
+            acc["multi"] += mv
+            acc["qtd"] += 1
+        return acc_total, dia_a_dia
+
+    tot_funil,  por_dia        = soma_dia(ganhos)
+    tot_equipe, por_dia_equipe = soma_dia(ganhos_equipe)
+
+    # Régua PRINCIPAL = funil inteiro: toda venda do Navigator + MGM, de quem for.
+    # A régua da equipe (só quem está em CLOSERS) fica ao lado, como recorte.
+    real_bruto = tot_funil["bruto"]
+    real_multi = tot_funil["multi"]
+    real_bruto_equipe = tot_equipe["bruto"]
+    real_multi_equipe = tot_equipe["multi"]
 
     hoje_str = hoje.strftime("%Y-%m-%d")
     dia_ontem = ultimo_du(hoje, feriados)
@@ -1210,16 +1236,24 @@ def calcular_navigator(mes=None, ano=None):
     b_hoje = bucket_dia(abertos, hoje_str)
     b_ontem = bucket_dia(abertos, ontem_str)
     b_semana = bucket_dias(abertos, dias_semana)
-    g_semana = {"bruto": 0.0, "multi": 0.0, "qtd": 0}
-    for d in dias_semana:
-        acc = por_dia.get(d)
-        if acc:
-            g_semana["bruto"] += acc["bruto"]
-            g_semana["multi"] += acc["multi"]
-            g_semana["qtd"] += acc["qtd"]
+    ZERO = {"bruto": 0.0, "multi": 0.0, "qtd": 0}
 
-    g_hoje = por_dia.get(hoje_str, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
-    g_ontem = por_dia.get(ontem_str, {"bruto": 0.0, "multi": 0.0, "qtd": 0})
+    def janela(mapa, dias):
+        acc = {"bruto": 0.0, "multi": 0.0, "qtd": 0}
+        for d in dias:
+            x = mapa.get(d)
+            if x:
+                acc["bruto"] += x["bruto"]
+                acc["multi"] += x["multi"]
+                acc["qtd"] += x["qtd"]
+        return acc
+
+    g_semana        = janela(por_dia,        dias_semana)
+    g_semana_equipe = janela(por_dia_equipe, dias_semana)
+    g_hoje          = por_dia.get(hoje_str,  dict(ZERO))
+    g_ontem         = por_dia.get(ontem_str, dict(ZERO))
+    g_hoje_equipe   = por_dia_equipe.get(hoje_str,  dict(ZERO))
+    g_ontem_equipe  = por_dia_equipe.get(ontem_str, dict(ZERO))
 
     # ── Métricas do painel ────────────────────────────────────
     meta_dia = safe_div(meta_mes, du_total)
@@ -1248,6 +1282,20 @@ def calcular_navigator(mes=None, ano=None):
         "entrou_hoje_bruto":  arred(g_hoje["bruto"]),
         "qtd_ganhos_mes":     len(ganhos),
         "ticket_medio":       arred(safe_div(real_bruto, len(ganhos))) if ganhos else 0.0,
+
+        # ── recorte da equipe (só quem está em CLOSERS) ───────
+        "real_bruto_equipe":         arred(real_bruto_equipe),
+        "real_multi_equipe":         arred(real_multi_equipe),
+        "atingimento_equipe":        arred(safe_div(real_multi_equipe, meta_mes) * 100),
+        "atingimento_bruto_equipe":  arred(safe_div(real_bruto_equipe, meta_mes) * 100),
+        "gap_100_equipe":            arred(meta_mes - real_multi_equipe),
+        "meta_dia_100_equipe":       arred(safe_div(meta_mes - real_multi_equipe, du_rest)) if du_rest else 0.0,
+        "entrou_ontem_multi_equipe": arred(g_ontem_equipe["multi"]),
+        "entrou_ontem_bruto_equipe": arred(g_ontem_equipe["bruto"]),
+        "entrou_hoje_multi_equipe":  arred(g_hoje_equipe["multi"]),
+        "entrou_hoje_bruto_equipe":  arred(g_hoje_equipe["bruto"]),
+        "qtd_ganhos_mes_equipe":     len(ganhos_equipe),
+        "ticket_medio_equipe":       arred(safe_div(real_bruto_equipe, len(ganhos_equipe))) if ganhos_equipe else 0.0,
     }
 
     # ── Forecast de hoje em diante (bloco "Forecast" do painel) ──
@@ -1297,9 +1345,28 @@ def calcular_navigator(mes=None, ano=None):
             "previsto_hoje": arred(v["previsto_hoje"]),
         })
     lista_closers = _lista_norm(CLOSERS_LISTA)
+    fora_da_equipe = []
     if lista_closers:
+        fora_da_equipe = [c for c in closers if norm(c["nome"]) not in lista_closers
+                          and (c["qtd"] or c["real_bruto"])]
         closers = [c for c in closers if norm(c["nome"]) in lista_closers]
     closers.sort(key=lambda x: -x["real_multi"])
+    fora_da_equipe.sort(key=lambda x: -x["real_bruto"])
+
+    # A diferença entre as duas réguas: quem ganhou no funil sem estar em CLOSERS.
+    fora_bruto = sum(c["real_bruto"] for c in fora_da_equipe)
+    fora_multi = sum(c["real_multi"] for c in fora_da_equipe)
+    equipe = {
+        "lista": [c["nome"] for c in closers],
+        "fora": [{"nome": c["nome"], "qtd": c["qtd"],
+                  "real_bruto": c["real_bruto"], "real_multi": c["real_multi"]}
+                 for c in fora_da_equipe],
+        "fora_qtd": sum(c["qtd"] for c in fora_da_equipe),
+        "fora_bruto": arred(fora_bruto),
+        "fora_multi": arred(fora_multi),
+        "pct_fora": (arred(safe_div(fora_multi, real_multi) * 100)
+                     if real_multi else 0.0),
+    }
 
     # ── SDRs (régua do painel gerente_comercial) ──────────────
     sdrs, erro_sdr = [], None
@@ -1394,6 +1461,15 @@ def calcular_navigator(mes=None, ano=None):
         alertas.append("Não consegui montar a quebra por frente agora — " + erro_frentes)
     if erro_ref:
         alertas.append("Não consegui contar os referidos agora — " + erro_ref)
+    if equipe["fora"]:
+        quem = ", ".join(f"{c['nome']} ({c['qtd']})" for c in equipe["fora"][:4])
+        if len(equipe["fora"]) > 4:
+            quem += f" e mais {len(equipe['fora']) - 4}"
+        val = f"{equipe['fora_multi']:,.0f}".replace(",", ".")
+        alertas.append(
+            f"Os totais somam o funil inteiro. R$ {val} ({equipe['pct_fora']:.1f}%) vieram de "
+            f"{equipe['fora_qtd']} venda(s) de quem não está na lista de closers — {quem} — "
+            "e por isso não aparecem na tabela Por Closer.")
     for a in ((resumo_frentes or {}).get("alertas") or []):
         alertas.append(a)
     if not closers_meta and not META_FIXA:
@@ -1430,6 +1506,7 @@ def calcular_navigator(mes=None, ano=None):
         },
         "metricas": metricas,
         "closers": closers,
+        "equipe": equipe,
         "sdrs": sdrs,
         "reunioes": {
             "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
@@ -1454,6 +1531,9 @@ def calcular_navigator(mes=None, ano=None):
             "entrou_bruto": arred(g_semana["bruto"]),
             "entrou_multi": arred(g_semana["multi"]),
             "qtd_vendas": g_semana["qtd"],
+            "entrou_bruto_equipe": arred(g_semana_equipe["bruto"]),
+            "entrou_multi_equipe": arred(g_semana_equipe["multi"]),
+            "qtd_vendas_equipe": g_semana_equipe["qtd"],
             "reunioes_agendadas": sum(
                 ((reunioes.get("contagem") or {}).get(d) or {}).get("agendadas", 0)
                 for d in dias_semana),
@@ -2248,6 +2328,7 @@ PAGINA_HTML = r"""<!DOCTYPE html>
                       letter-spacing:.6px;text-transform:uppercase;line-height:1.2}
   .graf-total .gt-val{font-size:17px;font-weight:800;color:var(--navy);line-height:1.15;margin-top:1px}
   .graf-total .gt-pct{font-size:11px;font-weight:700;color:var(--muted)}
+  .kcard .gt-eq{color:#43586F;font-weight:600}
   .graf-total .gt-sub{font-size:10px;color:var(--muted);line-height:1.3;margin-top:3px}
   .graf-total .gt-pos{color:#0D7A3E;font-weight:700}
   .graf-total .gt-neg{color:#B42318;font-weight:700}
@@ -2574,14 +2655,21 @@ function render(d){
     card('futuro', 'Futuras', N(rfut.agendadas || 0),
          `já na agenda depois de hoje · em ${N(rfut.dias || 0)} dia(s)`));
 
-  // 2 ── GANHO
-  const bGanho = bloco('Ganho', 'valores com multiplicador; o bruto vai no rodapé de cada card',
+  // 2 ── GANHO — duas réguas: EQUIPE (closers da lista) e FUNIL (tudo)
+  const eqNomes = (d.equipe && d.equipe.lista || []).join(' + ') || 'closers';
+  const soEq = v => v ? `<br><span class="gt-eq">equipe: ${v}</span>` : '';
+  const bGanho = bloco('Ganho',
+    `todo o funil (Navigator + MGM, qualquer dono) · "equipe" = recorte de ${esc(eqNomes)}`,
     card('ontem', 'Último dia útil', R(m.entrou_ontem_multi),
-         `bruto ${R(m.entrou_ontem_bruto)} · ${fmtDia(p.ontem)}`) +
+         `bruto ${R(m.entrou_ontem_bruto)} · ${fmtDia(p.ontem)}` +
+         soEq(m.entrou_ontem_multi_equipe !== m.entrou_ontem_multi ? R(m.entrou_ontem_multi_equipe) : '')) +
     card('hoje', 'Hoje', R(m.entrou_hoje_multi),
-         `bruto ${R(m.entrou_hoje_bruto)}`) +
+         `bruto ${R(m.entrou_hoje_bruto)}` +
+         soEq(m.entrou_hoje_multi_equipe !== m.entrou_hoje_multi ? R(m.entrou_hoje_multi_equipe) : '')) +
     card('forte', 'Total do mês', R(m.real_multi),
-         `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${R(m.ticket_medio)}`) +
+         `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${R(m.ticket_medio)}` +
+         soEq(m.real_multi_equipe !== m.real_multi
+              ? `${R(m.real_multi_equipe)} · ${N(m.qtd_ganhos_mes_equipe)} venda(s)` : '')) +
     card('futuro', 'Previsto futuro', R(df.previsto || 0),
          `ponderado do pipe de hoje em diante`));
 
@@ -2598,33 +2686,44 @@ function render(d){
   const bVisao1 = bloco('Visão mês', `${N(p.du_passados)} de ${N(p.du_total)} dias úteis`,
     card('', 'Meta do dia', R(m.meta_dia),
          `meta do mês ${R(m.meta_mes)} ÷ ${N(p.du_total)} DU`) +
-    card('', 'Realizado', R(m.real_bruto), 'bruto, sem multiplicador') +
+    card('', 'Realizado', R(m.real_bruto), 'bruto, sem multiplicador' +
+         soEq(m.real_bruto_equipe !== m.real_bruto ? R(m.real_bruto_equipe) : '')) +
     card('forte', 'Realizado c/ multiplicador', R(m.real_multi),
-         'é este que bate contra a meta') +
+         'é este que bate contra a meta' +
+         soEq(m.real_multi_equipe !== m.real_multi ? R(m.real_multi_equipe) : '')) +
     card('', 'MTD — deveria estar', R(m.deveria_mtd),
          `${P(m.pct_mes_decorrido)} do mês decorrido`));
 
   // 5 ── VISÃO MÊS: como estamos
-  const bVisao2 = bloco('Visão mês', 'atingimento e o que falta', `
+  const temRecorte = m.real_multi_equipe !== m.real_multi;
+  const gapClsEq = m.gap_100_equipe > 0 ? 'neg' : 'pos';
+  const bVisao2 = bloco('Visão mês', `atingimento e o que falta · meta ${R(m.meta_mes)}`, `
     <div class="kcard forte">
       <div class="rot">Atingimento</div>
       <div class="val ${m.atingimento >= 100 ? 'pos' : ''}">${P(m.atingimento)}</div>
-      <div class="sub">c/ multiplicador · bruto ${P(m.atingimento_bruto)}</div>
+      <div class="sub">c/ multiplicador · bruto ${P(m.atingimento_bruto)}${
+        temRecorte ? `<br><span class="gt-eq">equipe: ${P(m.atingimento_equipe)}</span>` : ''}</div>
     </div>
     <div class="kcard forte">
       <div class="rot">Gap 100%</div>
       <div class="val ${gapCls}">${R(m.gap_100)}</div>
       <div class="sub">${p.du_restantes > 0
-        ? `${R(m.meta_dia_100)}/dia nos ${N(p.du_restantes)} DU que faltam (bruto ${R(m.meta_dia_100_bruto)})`
-        : 'mês encerrado'}</div>
+        ? `${R(m.meta_dia_100)}/dia nos ${N(p.du_restantes)} DU que faltam`
+        : 'mês encerrado'}${
+        temRecorte ? `<br><span class="gt-eq">equipe: ${R(m.gap_100_equipe)}</span>` : ''}</div>
     </div>`);
 
   // 6 ── SEMANA
   const bSemana = bloco('Semana',
     sem.ini ? `${fmtDia(sem.ini)} a ${fmtDia(sem.fim)}` : '',
-    card('', 'Ganho', R(sem.entrou_bruto || 0), 'bruto') +
-    card('forte', 'Ganho c/ multiplicador', R(sem.entrou_multi || 0), 'é o que conta para a meta') +
-    card('', 'Volume', N(sem.qtd_vendas || 0), 'vendas fechadas na semana') +
+    card('', 'Ganho', R(sem.entrou_bruto || 0), 'bruto' +
+         soEq(sem.entrou_bruto_equipe !== sem.entrou_bruto ? R(sem.entrou_bruto_equipe) : '')) +
+    card('forte', 'Ganho c/ multiplicador', R(sem.entrou_multi || 0),
+         'é o que conta para a meta' +
+         soEq(sem.entrou_multi_equipe !== sem.entrou_multi ? R(sem.entrou_multi_equipe) : '')) +
+    card('', 'Volume', N(sem.qtd_vendas || 0),
+         'vendas fechadas na semana' +
+         soEq(sem.qtd_vendas_equipe !== sem.qtd_vendas ? `${N(sem.qtd_vendas_equipe)} venda(s)` : '')) +
     card('futuro', 'Aberto na semana — ponderado', R(sem.previsto || 0),
          `ponderado · 70% ${R((sem.p70||0)*0.7)} · 50% ${R((sem.p50||0)*0.5)} · 20% ${R((sem.p20||0)*0.2)}
           <br>de ${R(sem.em_aberto || 0)} em aberto (${N(sem.qtd_abertos || 0)} negócios)`) +
@@ -2712,8 +2811,19 @@ function render(d){
       qtd:a.qtd+c.qtd, prev:a.prev+c.previsto_hoje, ab:a.ab+c.aberto_hoje
     }), {meta:0,bruto:0,multi:0,qtd:0,prev:0,ab:0});
 
+    const eq = d.equipe || {};
+    const notaEquipe = (eq.fora || []).length ? `
+      <div class="nota-comp" style="border-left:3px solid var(--amber);background:var(--amber-bg)">
+        Os totais do painel somam <b>todo o funil</b>. Esta tabela mostra só
+        ${esc((eq.lista || []).join(' e '))}, então ela <b>não fecha</b> com o topo:
+        ficam de fora ${eq.fora.map(f => `<b>${esc(f.nome)}</b> ${N(f.qtd)} venda(s) · ${R(f.real_multi)}`)
+          .join(' &nbsp;·&nbsp; ')} — ${R(eq.fora_multi)} no total, ${P(eq.pct_fora)} do mês.
+      </div>` : '';
+
     closersHtml = `
-    <div class="block-title">Por Closer<div class="rule"></div></div>
+    <div class="block-title">Por Closer<div class="rule"></div>
+      <span class="peso-nota">${(eq.lista || []).join(' · ')}</span></div>
+    ${notaEquipe}
     <div class="card">
       <div class="table-scroll">
         <table class="closers">
