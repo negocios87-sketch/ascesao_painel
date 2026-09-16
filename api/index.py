@@ -2372,6 +2372,15 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .graf-total .gt-val{font-size:17px;font-weight:800;color:var(--navy);line-height:1.15;margin-top:1px}
   .graf-total .gt-pct{font-size:11px;font-weight:700;color:var(--muted)}
   .kcard .gt-eq{color:#43586F;font-weight:600}
+  /* quebra em colunas dentro de um card */
+  .kcard .kc-cols{display:flex;gap:9px;margin-top:7px}
+  .kcard .kc-cols > div{flex:1;min-width:0}
+  .kcard .kc-cols > div + div{border-left:1px solid var(--border);padding-left:9px}
+  .kcard .kc-rot{font-size:10px;font-weight:800;color:var(--navy);letter-spacing:.5px}
+  .kcard .kc-val{font-size:14px;font-weight:700;color:var(--navy);line-height:1.25;
+                 font-variant-numeric:tabular-nums;white-space:nowrap}
+  .kcard .kc-sub{font-size:9px;color:var(--muted);white-space:nowrap}
+  .kcard .kc-cols + .sub{margin-top:8px;border-top:1px solid var(--border);padding-top:7px}
   .graf-total .gt-sub{font-size:10px;color:var(--muted);line-height:1.3;margin-top:3px}
   .graf-total .gt-pos{color:#0D7A3E;font-weight:700}
   .graf-total .gt-neg{color:#B42318;font-weight:700}
@@ -3648,10 +3657,17 @@ function renderCardsRange(){
       <div class="kcard forte"><div class="rot">Previsto no período</div>
         <div class="val">${R(previsto)}</div>
         <div class="sub">ponderado de ${R(aberto)} em aberto · ${N(qtd)} negócio(s)</div></div>
-      <div class="kcard futuro"><div class="rot">70% / 50% / 20%</div>
-        <div class="val">${R(p70)}</div>
-        <div class="sub">50% ${R(p50)} · 20% ${R(p20)}${
-          semProb ? `<br>${R(semProb)} sem probabilidade (fora do previsto)` : ''}</div></div>
+      <div class="kcard futuro"><div class="rot">Pipe por probabilidade</div>
+        <div class="kc-cols">
+          <div><div class="kc-rot">70%</div><div class="kc-val">${R(p70)}</div>
+               <div class="kc-sub">pondera ${R(p70 * 0.7)}</div></div>
+          <div><div class="kc-rot">50%</div><div class="kc-val">${R(p50)}</div>
+               <div class="kc-sub">pondera ${R(p50 * 0.5)}</div></div>
+          <div><div class="kc-rot">20%</div><div class="kc-val">${R(p20)}</div>
+               <div class="kc-sub">pondera ${R(p20 * 0.2)}</div></div>
+        </div>
+        <div class="sub">soma ${R(p70 + p50 + p20)} em aberto nessas três faixas${
+          semProb ? `<br><b>${R(semProb)}</b> sem probabilidade — fica fora do previsto` : ''}</div></div>
       <div class="kcard"><div class="rot">Entrou no período</div>
         <div class="val">${R(entrou)}</div>
         <div class="sub">c/ multiplicador · ${N(entrouQtd)} venda(s)</div></div>
