@@ -850,8 +850,48 @@ CF_PRODUTO      = os.environ.get("CF_PRODUTO", "09d57fd58b8cac693f5901417f758df7
 CF_PRODUTO_ALT  = os.environ.get("CF_PRODUTO_ALT", "8bdce76ba66f0fed0280918a4845190c92899ed5")
 
 
+def opcoes_do_campo(campo):
+    """
+    Mapa {id da opção -> label} de um campo de seleção.
+
+    A API devolve campo de lista como ID numérico, não como texto. Sem traduzir,
+    a tabela mostra "500" no lugar de "COAUTORIA". O /dealFields tem o de-para.
+    """
+    if not campo:
+        return {}
+
+    def _fetch():
+        try:
+            r = req.get(f"{BASE_V1}/dealFields", params={"api_token": API_KEY}, timeout=25)
+            r.raise_for_status()
+            for field in (r.json().get("data") or []):
+                if field.get("key") == campo:
+                    return {str(o.get("id")): str(o.get("label", "")).strip()
+                            for o in (field.get("options") or [])}
+        except Exception:
+            pass
+        return {}
+    return cached(f"opts:{campo}", 900, _fetch)
+
+
+def _rotulo_opcao(v, campo):
+    """Traduz um valor de campo de seleção para o label. Aceita id, dict ou texto."""
+    if isinstance(v, dict):
+        return str(v.get("label") or v.get("value") or "").strip()
+    txt = str(v).strip()
+    if not txt:
+        return ""
+    # ids podem vir como "500" ou "500,501" (multi-seleção)
+    mapa = opcoes_do_campo(campo)
+    partes = [t.strip() for t in txt.split(",") if t.strip()]
+    if partes and all(t.isdigit() for t in partes):
+        nomes = [mapa.get(t) or f"opção {t}" for t in partes]
+        return " + ".join(nomes)
+    return txt
+
+
 def produto_do_deal(deal):
-    """Nome do produto vendido. Lista primeiro, texto livre como reserva."""
+    """Nome do produto vendido. Lista primeiro (traduzindo o id), texto como reserva."""
     for campo in (CF_PRODUTO, CF_PRODUTO_ALT):
         if not campo:
             continue
@@ -859,12 +899,11 @@ def produto_do_deal(deal):
         if v is None:
             continue
         if isinstance(v, list):
-            v = " + ".join(str(x.get("label") if isinstance(x, dict) else x) for x in v if x)
-        elif isinstance(v, dict):
-            v = v.get("label") or v.get("value")
-        v = str(v).strip()
-        if v:
-            return v
+            nome = " + ".join(x for x in (_rotulo_opcao(i, campo) for i in v) if x)
+        else:
+            nome = _rotulo_opcao(v, campo)
+        if nome:
+            return nome
     return "(sem produto preenchido)"
 
 # Só negócios nesta etapa entram na previsão (20/50/70) e no pipe do dia.
