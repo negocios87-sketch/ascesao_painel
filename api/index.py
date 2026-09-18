@@ -71,6 +71,8 @@ DONO_REUNIAO = os.environ.get("DONO_REUNIAO", "Denise Mussolin")
 # Usados só no cálculo de SDR (mesmos filtros e campo do painel gerente_comercial)
 FILTER_ACTIVITIES = int(os.environ.get("FILTER_ACTIVITIES", "1310451"))
 FILTER_DEALS_RV   = int(os.environ.get("FILTER_DEALS_RV",   "1431880"))
+# Perdidos do ano, só dos funis do time de Ascensão (filtro montado no Pipedrive)
+FILTER_PERDIDOS   = int(os.environ.get("FILTER_PERDIDOS",   "1671544"))
 CF_QUALIFICADOR   = "a6f13cc27c8d041f3af4091283ce0d4fe0913875"
 
 
@@ -531,6 +533,47 @@ def buscar_activities_mes(mes, ano):
                 break
         return todos
     return cached(f"acts:{ano}-{mes}", 300, _fetch)
+
+
+def lost_time_br(deal):
+    """lost_time do Pipedrive vem em UTC; o painel raciocina em BRT."""
+    raw = str(deal.get("lost_time") or deal.get("close_time") or "")
+    if not raw:
+        return ""
+    txt = raw.replace("T", " ").replace("Z", "")[:19]
+    try:
+        return (datetime.strptime(txt, "%Y-%m-%d %H:%M:%S")
+                - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return txt
+
+
+def buscar_perdidos():
+    """
+    Negócios PERDIDOS do filtro do time (só deste ano, só funis da Ascensão).
+
+    O filtro já vem fechado do Pipedrive, então aqui é só paginar e guardar em
+    cache — a janela do mês é aplicada depois, com lost_time convertido para BRT.
+    """
+    def _fetch():
+        todos, start = [], 0
+        while True:
+            r = req.get(f"{BASE_V1}/deals", params={
+                "filter_id": FILTER_PERDIDOS, "status": "all_not_deleted",
+                "limit": 500, "start": start, "api_token": API_KEY,
+            }, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            lote = data.get("data") or []
+            todos += lote
+            mais = (data.get("additional_data", {})
+                        .get("pagination", {})
+                        .get("more_items_in_collection", False))
+            if not mais or not lote:
+                break
+            start += 500
+        return todos
+    return cached("perdidos", 300, _fetch)
 
 
 def buscar_deals_rv():
@@ -1894,6 +1937,48 @@ def calcular_graficos(mes=None, ano=None):
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
 
+    # ── perdidos do mês: série diária + motivos por frente ────
+    perdidos = {k: {d: 0 for d in dias} for k in chaves}
+    motivos  = {k: {} for k in chaves}
+    perdidos_total = {k: 0 for k in chaves}
+    erro_perd = None
+    try:
+        for d in buscar_perdidos():
+            dia = lost_time_br(d)[:10]
+            if dia not in perdidos["navigator"]:      # fora do mês pedido
+                continue
+            pid_d = d.get("pipeline_id")
+            if pid_d == PIPELINE_MGM:
+                f = "mgm"
+            elif pid_d == pid:
+                f = "renovacao" if eh_renovacao(d) else "navigator"
+            else:
+                continue                               # funil fora do escopo
+            perdidos[f][dia] += 1
+            perdidos_total[f] += 1
+            motivo = (d.get("lost_reason") or "").strip() or "(sem motivo preenchido)"
+            motivos[f][motivo] = motivos[f].get(motivo, 0) + 1
+    except Exception as e:
+        erro_perd = f"{type(e).__name__}: {e}"
+
+    # top 10 motivos por frente, com representatividade dentro da própria frente
+    tabelas_motivos = {}
+    for k in chaves:
+        tot = perdidos_total[k]
+        ordenado = sorted(motivos[k].items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ordenado[:10]
+        outros_qtd = sum(q for _, q in ordenado[10:])
+        tabelas_motivos[k] = {
+            "nome": NOMES_FRENTES[k],
+            "total": tot,
+            "distintos": len(ordenado),
+            "linhas": [{"motivo": m, "volume": q,
+                        "rep": arred(safe_div(q, tot) * 100)} for m, q in top],
+            "outros": {"volume": outros_qtd,
+                       "rep": arred(safe_div(outros_qtd, tot) * 100),
+                       "motivos": len(ordenado) - len(top)} if outros_qtd else None,
+        }
+
     # ── jacaré: meta acumulada x realizado acumulado ──────────
     meta_dia = safe_div(meta_mes, du_total)
     jacare, acum_du, acum_real, acum_bruto = [], 0, 0.0, 0.0
@@ -1939,6 +2024,8 @@ def calcular_graficos(mes=None, ano=None):
         alertas.append("Não consegui ler o funil MGM agora — " + erro_mgm)
     if erro_reu:
         alertas.append("Não consegui montar a série de reuniões — " + erro_reu)
+    if erro_perd:
+        alertas.append("Não consegui ler os perdidos agora — " + erro_perd)
 
     return {
         "periodo": {"mes": mes, "ano": ano, "hoje": hoje_str,
@@ -1958,6 +2045,10 @@ def calcular_graficos(mes=None, ano=None):
         "regra_reuniao": {"dono": DONO_REUNIAO, "fora_escopo": fora_escopo,
                           "fora_dono": fora_dono},
         "vendas":   {k: [arred(vendas[k][d]) for d in dias] for k in chaves},
+        "perdidos": {k: [perdidos[k][d] for d in dias] for k in chaves},
+        "perdidos_total": perdidos_total,
+        "motivos_perda": tabelas_motivos,
+        "filtro_perdidos": FILTER_PERDIDOS,
         "jacare": jacare,
         "atingimento": atingimento,
         "alertas": alertas,
@@ -2534,6 +2625,27 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .fc-aviso{padding:12px 16px;font-size:12px;color:var(--text);background:var(--amber-bg);
             border-bottom:1px solid #F0D9A8}
   .fc-vazio{padding:18px;text-align:center;color:var(--muted);font-size:12px}
+
+  /* MOTIVOS DE PERDA */
+  .perda-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;margin-bottom:20px}
+  .perda-card{background:var(--white);border:1px solid var(--border);border-radius:8px;
+              box-shadow:var(--shadow);overflow:hidden}
+  .perda-tit{display:flex;align-items:center;gap:8px;padding:12px 14px;font-size:12px;
+             font-weight:700;color:var(--navy);border-bottom:1px solid var(--border)}
+  .perda-tit .pt-dot{width:9px;height:9px;border-radius:2px;flex:none}
+  .perda-tit .pt-qtd{margin-left:auto;font-size:11px;font-weight:600;color:var(--muted)}
+  .perda{width:100%;border-collapse:collapse}
+  .perda thead th{background:#F7F8FA;color:var(--muted);font-size:9px;font-weight:700;
+                  letter-spacing:.6px;text-transform:uppercase;padding:7px 12px;text-align:left}
+  .perda thead th.num{text-align:right}
+  .perda td{padding:7px 12px;border-bottom:1px solid #F0F1F5;font-size:12px}
+  .perda td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .perda td.pos-n{width:18px;color:#B9BDC7;font-size:10px;font-weight:700;padding-right:0}
+  .perda td.mot{color:var(--text)}
+  .perda tbody tr:hover{background:#FAFAFC}
+  .perda tr.outros td{color:var(--muted);font-style:italic}
+  .perda tr.total td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700}
+  .perda .perda-vazio{text-align:center;color:var(--muted);padding:22px;font-style:italic}
   .fc-range{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--white);
             border:1px solid var(--border);border-radius:8px;padding:12px 16px;
             box-shadow:var(--shadow);margin-bottom:12px}
@@ -3127,6 +3239,8 @@ function verReferidos(){
 
 // ── GRÁFICOS ──────────────────────────────────────────────────
 const COR_FRENTE = { navigator: '#1A1A2E', mgm: '#B8860B', renovacao: '#7A8CA8' };
+// perdidos em tons quentes dessaturados — separa do que é venda sem virar carnaval
+const COR_PERDA  = { navigator: '#8C3A34', mgm: '#C08457', renovacao: '#B9A79B' };
 let CHARTS = {};
 
 function destroiCharts(){
@@ -3268,6 +3382,50 @@ function renderGraficos(d){
 
   const cm = d.conversao_mes || {};
 
+  // ── motivos de perda: uma tabela por frente, top 10 ──
+  const mp = d.motivos_perda || {};
+  const tabelaPerda = k => {
+    const t = mp[k];
+    if (!t) return '';
+    const corpo = t.linhas.length
+      ? t.linhas.map((l, i) => `
+          <tr>
+            <td class="pos-n">${i + 1}</td>
+            <td class="mot">${esc(l.motivo)}</td>
+            <td class="num">${N(l.volume)}</td>
+            <td class="num">${P(l.rep)}</td>
+          </tr>`).join('') +
+        (t.outros ? `
+          <tr class="outros">
+            <td></td>
+            <td class="mot">outros ${N(t.outros.motivos)} motivo(s)</td>
+            <td class="num">${N(t.outros.volume)}</td>
+            <td class="num">${P(t.outros.rep)}</td>
+          </tr>` : '') +
+        `<tr class="total">
+            <td></td><td class="mot">TOTAL</td>
+            <td class="num">${N(t.total)}</td><td class="num">100,0%</td>
+         </tr>`
+      : `<tr><td colspan="4" class="perda-vazio">Nenhum perdido nesta frente no mês.</td></tr>`;
+    return `
+      <div class="perda-card">
+        <div class="perda-tit"><span class="pt-dot" style="background:${COR_FRENTE[k]}"></span>
+          ${esc(t.nome)}<span class="pt-qtd">${N(t.total)} perdido(s)</span></div>
+        <table class="perda">
+          <thead><tr>
+            <th></th><th>Motivo</th><th class="num">Volume</th><th class="num">Rep.</th>
+          </tr></thead>
+          <tbody>${corpo}</tbody>
+        </table>
+      </div>`;
+  };
+  const totPerd = fr.reduce((a, f) => a + ((mp[f.chave] || {}).total || 0), 0);
+  const tabelasPerda = `
+    <div class="block-title">Motivos de perda — top 10 por frente<div class="rule"></div>
+      <span class="peso-nota">${N(totPerd)} perdido(s) no mês · Rep. = fatia dentro da própria frente</span>
+    </div>
+    <div class="perda-grid">${fr.map(f => tabelaPerda(f.chave)).join('')}</div>`;
+
   document.getElementById('conteudo-graficos').innerHTML = `
     <div class="block-title">Atingimento por frente<div class="rule"></div></div>
     <div class="cards">${cardsAting}</div>
@@ -3290,6 +3448,14 @@ function renderGraficos(d){
     </div>
 
     <div class="graf">
+      <div class="graf-tit">Perdidos por dia</div>
+      <div class="graf-sub">Negócios marcados como perdidos, empilhado por frente ·
+        filtro ${N(d.filtro_perdidos)} do Pipedrive</div>
+      <div class="graf-box"><canvas id="g-perdidos"></canvas>
+        ${caixaTotal('Perdidos no mês', d.perdidos, fr, v => N(v))}</div>
+    </div>
+
+    <div class="graf">
       <div class="graf-tit">Meta x Realizado acumulado</div>
       <div class="graf-sub">Meta de ${R(d.periodo.meta_mes)} distribuída pelos ${N(d.periodo.du_total)} dias úteis,
         contra o realizado acumulado — linha cheia é o <b>bruto</b>, pontilhada é o valor
@@ -3297,6 +3463,7 @@ function renderGraficos(d){
       <div class="graf-box alto"><canvas id="g-jacare"></canvas>
         ${caixaJacare(d)}</div>
     </div>
+    ${tabelasPerda}
     ${alertas}
     <div class="rodape">Atualizado em ${d.periodo.atualizado_em}</div>`;
 
@@ -3325,7 +3492,16 @@ function renderGraficos(d){
     { fmt: v => R(v), rotulo: v => kCurto(v), tickY: v => kBRL(v) }
   ));
 
-  // 3 — jacaré
+  // 3 — perdidos por dia
+  CHARTS.perd = new Chart(document.getElementById('g-perdidos'), baseEmpilhado(
+    d.dias,
+    fr.map(f => ({ label: f.nome, data: d.perdidos[f.chave],
+                   backgroundColor: COR_PERDA[f.chave], borderWidth: 0,
+                   borderRadius: 2, maxBarThickness: 30 })),
+    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v) }
+  ));
+
+  // 4 — jacaré
   CHARTS.jac = new Chart(document.getElementById('g-jacare'), {
     type: 'line',
     data: {
