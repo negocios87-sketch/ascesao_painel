@@ -842,6 +842,31 @@ ORIGEM_REFERIDO    = os.environ.get("ORIGEM_REFERIDO", "buzzlead")
 CF_TAG_REFERIDO    = os.environ.get("CF_TAG_REFERIDO", TAG_RENOVACAO_CAMPO)
 TAG_REFERIDO_VALOR = os.environ.get("TAG_REFERIDO_VALOR", "indicacao-comercial")
 
+# ── PRODUTO VENDIDO ───────────────────────────────────────────
+# Campo de LISTA (label limpo, sem variação de grafia). O de texto livre entra
+# como reserva quando a lista está vazia — lá o mesmo produto aparece escrito de
+# jeitos diferentes, então ele é o plano B, não o principal.
+CF_PRODUTO      = os.environ.get("CF_PRODUTO", "09d57fd58b8cac693f5901417f758df746223273")
+CF_PRODUTO_ALT  = os.environ.get("CF_PRODUTO_ALT", "8bdce76ba66f0fed0280918a4845190c92899ed5")
+
+
+def produto_do_deal(deal):
+    """Nome do produto vendido. Lista primeiro, texto livre como reserva."""
+    for campo in (CF_PRODUTO, CF_PRODUTO_ALT):
+        if not campo:
+            continue
+        v = cf(deal, campo)
+        if v is None:
+            continue
+        if isinstance(v, list):
+            v = " + ".join(str(x.get("label") if isinstance(x, dict) else x) for x in v if x)
+        elif isinstance(v, dict):
+            v = v.get("label") or v.get("value")
+        v = str(v).strip()
+        if v:
+            return v
+    return "(sem produto preenchido)"
+
 # Só negócios nesta etapa entram na previsão (20/50/70) e no pipe do dia.
 # Casa por trecho do nome, então "Negocia" pega "Negociação" em qualquer funil.
 # Etapas que entram no forecast. Aceita lista separada por vírgula; cada item é
@@ -1974,6 +1999,37 @@ def calcular_graficos(mes=None, ano=None):
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
 
+    # ── produtos vendidos: uma tabela por frente ──────────────
+    prod = {k: {} for k in chaves}
+    for d in ganhos_nav + ganhos_mgm:
+        dia = won_time_br(d)[:10]
+        if dia not in vendas["navigator"]:
+            continue
+        f = frente_por_deal.get(d.get("id"), "navigator")
+        nome_p = produto_do_deal(d)
+        acc = prod[f].setdefault(nome_p, {"valor": 0.0, "multi": 0.0, "qtd": 0})
+        acc["valor"] += float(d.get("value") or 0)
+        acc["multi"] += float(cf(d, CF_MULTIPLICADOR) or 0)
+        acc["qtd"] += 1
+
+    tabelas_produto = {}
+    for k in chaves:
+        linhas = [{"produto": p_, "valor": arred(v["valor"]), "multi": arred(v["multi"]),
+                   "volume": v["qtd"],
+                   "ticket": arred(safe_div(v["valor"], v["qtd"])) if v["qtd"] else 0.0}
+                  for p_, v in prod[k].items()]
+        linhas.sort(key=lambda x: -x["valor"])
+        tot_v = sum(l["valor"] for l in linhas)
+        tot_q = sum(l["volume"] for l in linhas)
+        tabelas_produto[k] = {
+            "nome": NOMES_FRENTES[k],
+            "linhas": linhas,
+            "total_valor": arred(tot_v),
+            "total_multi": arred(sum(l["multi"] for l in linhas)),
+            "total_volume": tot_q,
+            "ticket_geral": arred(safe_div(tot_v, tot_q)) if tot_q else 0.0,
+        }
+
     # ── perdidos do mês: série diária + motivos por frente ────
     perdidos = {k: {d: 0 for d in dias} for k in chaves}
     motivos  = {k: {} for k in chaves}
@@ -2082,6 +2138,7 @@ def calcular_graficos(mes=None, ano=None):
         "regra_reuniao": {"dono": DONO_REUNIAO, "fora_escopo": fora_escopo,
                           "fora_time": fora_time, "time": time_reuniao},
         "vendas":   {k: [arred(vendas[k][d]) for d in dias] for k in chaves},
+        "produtos": tabelas_produto,
         "perdidos": {k: [perdidos[k][d] for d in dias] for k in chaves},
         "perdidos_total": perdidos_total,
         "motivos_perda": tabelas_motivos,
@@ -3470,6 +3527,44 @@ function renderGraficos(d){
 
   const cm = d.conversao_mes || {};
 
+  // ── produtos vendidos: uma tabela por frente ──
+  const pr = d.produtos || {};
+  const tabelaProduto = k => {
+    const t = pr[k];
+    if (!t) return '';
+    const corpo = t.linhas.length
+      ? t.linhas.map(l => `
+          <tr>
+            <td class="mot">${esc(l.produto)}</td>
+            <td class="num">${R(l.valor)}</td>
+            <td class="num">${N(l.volume)}</td>
+            <td class="num">${R(l.ticket)}</td>
+          </tr>`).join('') +
+        `<tr class="total">
+            <td class="mot">TOTAL</td>
+            <td class="num">${R(t.total_valor)}</td>
+            <td class="num">${N(t.total_volume)}</td>
+            <td class="num">${R(t.ticket_geral)}</td>
+         </tr>`
+      : `<tr><td colspan="4" class="perda-vazio">Nenhuma venda nesta frente no mês.</td></tr>`;
+    return `
+      <div class="perda-card">
+        <div class="perda-tit"><span class="pt-dot" style="background:${COR_FRENTE[k]}"></span>
+          ${esc(t.nome)}<span class="pt-qtd">${R(t.total_valor)} · ${N(t.total_volume)} venda(s)</span></div>
+        <table class="perda">
+          <thead><tr>
+            <th>Produto</th><th class="num">Valor</th><th class="num">Vol.</th><th class="num">Ticket</th>
+          </tr></thead>
+          <tbody>${corpo}</tbody>
+        </table>
+      </div>`;
+  };
+  const tabelasProduto = `
+    <div class="block-title">Produtos vendidos por frente<div class="rule"></div>
+      <span class="peso-nota">valor bruto · ticket = valor ÷ volume</span>
+    </div>
+    <div class="perda-grid">${fr.map(f => tabelaProduto(f.chave)).join('')}</div>`;
+
   // ── motivos de perda: uma tabela por frente, top 10 ──
   const mp = d.motivos_perda || {};
   const tabelaPerda = k => {
@@ -3534,6 +3629,8 @@ function renderGraficos(d){
       <div class="graf-box"><canvas id="g-vendas"></canvas>
         ${caixaTotal('Vendas brutas no mês', d.vendas, fr, v => R(v))}</div>
     </div>
+
+    ${tabelasProduto}
 
     <div class="graf">
       <div class="graf-tit">Meta x Realizado acumulado</div>
