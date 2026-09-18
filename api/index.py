@@ -3448,20 +3448,20 @@ function renderGraficos(d){
     </div>
 
     <div class="graf">
-      <div class="graf-tit">Perdidos por dia</div>
-      <div class="graf-sub">Negócios marcados como perdidos, empilhado por frente ·
-        filtro ${N(d.filtro_perdidos)} do Pipedrive</div>
-      <div class="graf-box"><canvas id="g-perdidos"></canvas>
-        ${caixaTotal('Perdidos no mês', d.perdidos, fr, v => N(v))}</div>
-    </div>
-
-    <div class="graf">
       <div class="graf-tit">Meta x Realizado acumulado</div>
       <div class="graf-sub">Meta de ${R(d.periodo.meta_mes)} distribuída pelos ${N(d.periodo.du_total)} dias úteis,
         contra o realizado acumulado — linha cheia é o <b>bruto</b>, pontilhada é o valor
         <b>com multiplicador</b> (é essa que bate contra a meta)</div>
       <div class="graf-box alto"><canvas id="g-jacare"></canvas>
         ${caixaJacare(d)}</div>
+    </div>
+
+    <div class="graf">
+      <div class="graf-tit">Perdidos por dia</div>
+      <div class="graf-sub">Negócios marcados como perdidos, empilhado por frente ·
+        filtro ${N(d.filtro_perdidos)} do Pipedrive</div>
+      <div class="graf-box"><canvas id="g-perdidos"></canvas>
+        ${caixaTotal('Perdidos no mês', d.perdidos, fr, v => N(v))}</div>
     </div>
     ${tabelasPerda}
     ${alertas}
@@ -3492,16 +3492,7 @@ function renderGraficos(d){
     { fmt: v => R(v), rotulo: v => kCurto(v), tickY: v => kBRL(v) }
   ));
 
-  // 3 — perdidos por dia
-  CHARTS.perd = new Chart(document.getElementById('g-perdidos'), baseEmpilhado(
-    d.dias,
-    fr.map(f => ({ label: f.nome, data: d.perdidos[f.chave],
-                   backgroundColor: COR_PERDA[f.chave], borderWidth: 0,
-                   borderRadius: 2, maxBarThickness: 30 })),
-    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v) }
-  ));
-
-  // 4 — jacaré
+  // 3 — jacaré
   CHARTS.jac = new Chart(document.getElementById('g-jacare'), {
     type: 'line',
     data: {
@@ -3550,6 +3541,15 @@ function renderGraficos(d){
     },
     plugins: [ChartDataLabels]
   });
+
+  // 4 — perdidos por dia
+  CHARTS.perd = new Chart(document.getElementById('g-perdidos'), baseEmpilhado(
+    d.dias,
+    fr.map(f => ({ label: f.nome, data: d.perdidos[f.chave],
+                   backgroundColor: COR_PERDA[f.chave], borderWidth: 0,
+                   borderRadius: 2, maxBarThickness: 30 })),
+    { fmt: v => N(v), rotulo: v => N(v), tickY: v => N(v) }
+  ));
 }
 
 async function carregarGraficos(){
