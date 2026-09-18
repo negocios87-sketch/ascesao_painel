@@ -2378,7 +2378,52 @@ def health_payload():
         "senha_ativa": bool(PAINEL_SENHA),
         "hoje_br": hoje_br().isoformat(),
         "path_recebido": request.path,
+        "reunioes": diagnostico_reunioes(),
     })
+
+
+def diagnostico_reunioes():
+    """
+    Por que o número de reuniões está no valor que está.
+
+    O ponto mais frágil da régua é casar NOME (das variáveis CLOSERS/SDRS/EXCLUIR_REU)
+    com o nome do usuário no Pipedrive. Se não casar, o painel descarta tudo em
+    silêncio. Aqui isso fica visível: quem casou, quem não casou, e a lista completa
+    de usuários com id e nome para conferir a grafia.
+    """
+    try:
+        users = buscar_users()
+    except Exception as e:
+        return {"erro": f"{type(e).__name__}: {e}"}
+
+    time_cfg = set(_lista_norm(TIME_REUNIAO))
+    origem = "TIME_REUNIAO"
+    if not time_cfg:
+        time_cfg = set(_lista_norm(CLOSERS_LISTA)) | set(_lista_norm(SDRS_LISTA))
+        origem = "CLOSERS + SDRS"
+    excluidos = set(_lista_norm(EXCLUIR_REU))
+    alvo = time_cfg - excluidos
+
+    por_norm = {norm(nome): (uid, nome) for uid, nome in users.items()}
+    casou = {n: por_norm[n][1] for n in sorted(alvo) if n in por_norm}
+    nao_casou = sorted(n for n in alvo if n not in por_norm)
+
+    return {
+        "origem_da_lista": origem,
+        "configurado": sorted(time_cfg),
+        "excluir_reu": sorted(excluidos),
+        "quem_pode_agendar": sorted(casou.values()),
+        "NAO_ENCONTRADO_NO_PIPEDRIVE": nao_casou,
+        "aviso": ("Nome(s) configurado(s) que não existem no Pipedrive com essa grafia — "
+                  "toda reunião dessa pessoa está sendo descartada."
+                  if nao_casou else None),
+        "dono_reuniao": DONO_REUNIAO,
+        "dono_encontrado": DONO_REUNIAO in users.values(),
+        "filtro_atividades": FILTER_ACTIVITIES,
+        "filtro_reuniao_validada": FILTER_DEALS_RV,
+        "usuarios_pipedrive": [{"id": uid, "nome": nome}
+                               for uid, nome in sorted(users.items(), key=lambda kv: str(kv[1]))],
+    }
 
 
 # ── PÁGINA (HTML embutido: a Vercel não serve estático neste projeto) ──────
