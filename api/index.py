@@ -68,6 +68,13 @@ EXCLUIR_REU = os.environ.get("EXCLUIR_REU", "Denise Mussolin")
 # (o responsável pela atividade é quem AGENDOU, normalmente a SDR)
 DONO_REUNIAO = os.environ.get("DONO_REUNIAO", "Denise Mussolin")
 
+# Quem pode AGENDAR para a reunião contar. Vazio = CLOSERS + SDRS.
+# É o time de Ascensão: a régua de "agendada" é funil + responsável do time.
+TIME_REUNIAO = os.environ.get("TIME_REUNIAO", "")
+# Rede de segurança: reunião em negócio do DONO_REUNIAO conta mesmo que quem
+# agendou esteja fora da lista — impede que a régua nova derrube número antigo.
+REU_SEMPRE_DONO = os.environ.get("REU_SEMPRE_DONO", "1") not in ("0", "false", "")
+
 # Usados só no cálculo de SDR (mesmos filtros e campo do painel gerente_comercial)
 FILTER_ACTIVITIES = int(os.environ.get("FILTER_ACTIVITIES", "1310451"))
 FILTER_DEALS_RV   = int(os.environ.get("FILTER_DEALS_RV",   "1431880"))
@@ -1005,36 +1012,44 @@ def so_em_negociacao(deals):
 
 def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=None):
     """
-    Reuniões por dia.
+    Reuniões por dia. Duas réguas diferentes, de propósito:
 
-    Quem define a reunião é o DONO DO NEGÓCIO (DONO_REUNIAO — a Denise, que conduz),
-    não quem agendou. Reunião agendada por qualquer pessoa conta, desde que o negócio
-    seja dela e esteja em funil do escopo.
+      AGENDADA  = atividade com negócio vinculado, em funil do escopo (Navigator/MGM),
+                  com due_date naquele dia (BRT), e cujo RESPONSÁVEL (quem agendou)
+                  é do time de Ascensão MENOS quem está em EXCLUIR_REU.
+                  Não importa de quem é o negócio. Deduplicada por dia + negócio.
 
-      agendadas  = atividades com negócio da Denise, em funil do escopo, com due_date
-                   naquele dia (BRT), deduplicadas por negócio
-      realizadas = as concluídas que também estão no filtro de Reunião Validada
+      REALIZADA = subconjunto das agendadas: concluída, dentro do filtro de Reunião
+                  Validada, e em negócio de DONO_REUNIAO (a Denise, que conduz).
 
-    Descartes ficam registrados: "fora_escopo" (outro funil) e "fora_dono" (negócio de
-    outra pessoa), para o painel poder mostrar quanto ficou de fora e por quê.
+    Por isso realizadas ⊆ agendadas sempre. A régua de agendada é larga porque a
+    pergunta é "quanta reunião o time colocou na agenda"; a de realizada é estreita
+    porque a pergunta é "quanta reunião de verdade aconteceu".
 
-    Com DONO_REUNIAO vazio, volta à régua antiga: filtra pelo responsável (CLOSERS+SDRS
-    menos EXCLUIR_REU) e exige responsável != dono do negócio.
+    Descartes ficam contados e NOMEADOS: "fora_escopo" (negócio em outro funil) e
+    "fora_time" (quem agendou não está na lista) — com responsaveis_fora dizendo quem.
     """
     dono_alvo = norm(DONO_REUNIAO)
-    por_dono = bool(dono_alvo)
 
-    equipe = set(_lista_norm(CLOSERS_LISTA)) | set(_lista_norm(SDRS_LISTA))
+    time_reu = set(_lista_norm(TIME_REUNIAO))
+    if not time_reu:
+        time_reu = set(_lista_norm(CLOSERS_LISTA)) | set(_lista_norm(SDRS_LISTA))
+    # EXCLUIR_REU tira gente da lista de quem pode agendar. A Denise entra aqui:
+    # ela conduz a reunião, não marca — a cópia no nome dela é duplicata do Pipedrive.
     excluidos = set(_lista_norm(EXCLUIR_REU))
-    uids_equipe = {str(uid) for uid, nome in users.items()
-                   if norm(nome) in equipe and norm(nome) not in excluidos}
+    time_reu -= excluidos
+    uids_time = {str(uid) for uid, nome in users.items() if norm(nome) in time_reu}
+    uids_excluidos = {str(uid) for uid, nome in users.items() if norm(nome) in excluidos}
     nome_por_uid = {str(uid): nome for uid, nome in users.items()}
 
-    fora_escopo = fora_dono = 0
+    fora_escopo = fora_time = 0
+    responsaveis_fora = {}
     contagem = {d: {"agendadas": 0, "realizadas": 0} for d in dias}
     detalhe = {d: [] for d in dias}
-    if not por_dono and not uids_equipe:
-        return {"contagem": contagem, "detalhe": detalhe, "fora_escopo": 0, "fora_dono": 0}
+    if not uids_time and not dono_alvo:
+        return {"contagem": contagem, "detalhe": detalhe, "conversao": {},
+                "fora_escopo": 0, "fora_time": 0, "responsaveis_fora": {},
+                "time": sorted(time_reu)}
 
     acts = buscar_activities_mes(mes, ano)
     ids_rv, mapa_deal = buscar_deals_rv()
@@ -1052,8 +1067,6 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
 
     for a in acts:
         resp_uid = str(a.get("owner_id", ""))
-        if not por_dono and resp_uid not in uids_equipe:
-            continue
 
         dia, hora = due_br(a)                      # UTC -> BRT
         if dia not in contagem:
@@ -1064,6 +1077,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
             continue
         info = mapa_deal.get(deal_id) or {}
 
+        # 1) o negócio tem que estar em funil do escopo
         pid_deal = info.get("pipeline_id")
         if pipelines_escopo and pid_deal is not None and pid_deal not in pipelines_escopo:
             fora_escopo += 1
@@ -1071,18 +1085,34 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
 
         dono_uid = str(info.get("owner", ""))
         nome_dono = nome_por_uid.get(dono_uid, "")
-        if por_dono and norm(nome_dono) != dono_alvo:
-            fora_dono += 1
+        eh_do_dono = bool(dono_alvo) and norm(nome_dono) == dono_alvo
+
+        # 2) quem AGENDOU tem que ser do time de Ascensão.
+        #    Quem está em EXCLUIR_REU cai fora sempre — a exclusão vence inclusive
+        #    a rede de segurança abaixo, senão a cópia duplicada voltaria pela porta
+        #    dos fundos quando o negócio é do próprio dono-alvo.
+        if resp_uid in uids_excluidos:
+            fora_time += 1
+            quem = nome_por_uid.get(resp_uid) or f"uid {resp_uid or '—'}"
+            responsaveis_fora[quem] = responsaveis_fora.get(quem, 0) + 1
+            continue
+        #    Rede de segurança: reunião em negócio do dono-alvo conta mesmo que quem
+        #    agendou não esteja na lista — desde que não esteja excluído.
+        if resp_uid not in uids_time and not (REU_SEMPRE_DONO and eh_do_dono):
+            fora_time += 1
+            quem = nome_por_uid.get(resp_uid) or f"uid {resp_uid or '—'}"
+            responsaveis_fora[quem] = responsaveis_fora.get(quem, 0) + 1
             continue
 
+        # ── status: realizada é o subconjunto estreito ────────
         concluida = a.get("done") is True or a.get("status") == "done"
         motivo = None
         if not concluida:
             status = "pendente"
-        elif not por_dono and resp_uid and dono_uid and resp_uid == dono_uid:
-            status, motivo = "nao_validada", "quem agendou é o dono do negócio"
         elif deal_id not in ids_rv:
             status, motivo = "nao_validada", "fora do filtro de Reunião Validada"
+        elif dono_alvo and not eh_do_dono:
+            status, motivo = "nao_validada", f"negócio não é de {DONO_REUNIAO}"
         else:
             status = "realizada"
 
@@ -1139,7 +1169,10 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
     }
 
     return {"contagem": contagem, "detalhe": detalhe, "conversao": conversao,
-            "fora_escopo": fora_escopo, "fora_dono": fora_dono}
+            "fora_escopo": fora_escopo, "fora_time": fora_time,
+            "responsaveis_fora": dict(sorted(responsaveis_fora.items(),
+                                             key=lambda kv: -kv[1])),
+            "time": sorted(nome_por_uid[u] for u in uids_time)}
 
 
 def calcular_navigator(mes=None, ano=None):
@@ -1606,7 +1639,9 @@ def calcular_navigator(mes=None, ano=None):
             "excluidos": EXCLUIR_REU,
             "dono": DONO_REUNIAO,
             "fora_escopo": (reunioes.get("fora_escopo") or 0),
-            "fora_dono": (reunioes.get("fora_dono") or 0),
+            "fora_time": (reunioes.get("fora_time") or 0),
+            "responsaveis_fora": (reunioes.get("responsaveis_fora") or {}),
+            "time": (reunioes.get("time") or []),
         },
         "semana": {
             "ini": dom.strftime("%Y-%m-%d"),
@@ -1901,7 +1936,8 @@ def calcular_graficos(mes=None, ano=None):
     titulos   = {d: [] for d in dias}          # para o tooltip do gráfico
     com_reu   = {k: set() for k in chaves}     # negócios distintos com reunião validada
     ganhou    = {k: set() for k in chaves}     # ... e que estão Ganho
-    fora_escopo = fora_dono = 0
+    fora_escopo = fora_time = 0
+    time_reuniao = []
     erro_reu = None
     try:
         escopo = {pid} | ({PIPELINE_MGM} if PIPELINE_MGM else set())
@@ -1931,7 +1967,8 @@ def calcular_graficos(mes=None, ano=None):
                     "h": it.get("hora"),
                 })
         fora_escopo = r.get("fora_escopo", 0)
-        fora_dono = r.get("fora_dono", 0)
+        fora_time = r.get("fora_time", 0)
+        time_reuniao = r.get("time", [])
         for d in titulos:
             titulos[d].sort(key=lambda x: (x["h"] or "99:99"))
     except Exception as e:
@@ -2043,7 +2080,7 @@ def calcular_graficos(mes=None, ano=None):
         },
         "titulos": {d: titulos[d] for d in dias if titulos[d]},
         "regra_reuniao": {"dono": DONO_REUNIAO, "fora_escopo": fora_escopo,
-                          "fora_dono": fora_dono},
+                          "fora_time": fora_time, "time": time_reuniao},
         "vendas":   {k: [arred(vendas[k][d]) for d in dias] for k in chaves},
         "perdidos": {k: [perdidos[k][d] for d in dias] for k in chaves},
         "perdidos_total": perdidos_total,
@@ -2799,7 +2836,8 @@ function render(d){
   const det = q => `<button class="btn-det" onclick="verReunioes('${q}')">Detalhamento</button>`;
 
   // 1 ── REUNIÕES
-  const bReunioes = bloco('Reuniões', `regra: negócio de ${esc(reu.dono || DONO_REU)}`,
+  const bReunioes = bloco('Reuniões',
+    `agendada = funil Navigator/MGM + quem agendou é do time · validada = conduzida por ${esc(reu.dono || DONO_REU)}`,
     card('ontem', 'Último dia útil', N(reu.ontem.realizadas || 0),
          `validadas de ${N(reu.ontem.agendadas || 0)} agendadas · ${fmtDia(p.ontem)}`, det('ontem')) +
     card('hoje', 'Hoje', N(reu.hoje.agendadas || 0),
@@ -3180,14 +3218,19 @@ function verReunioes(qual){
           <tbody>${linhas}</tbody>
         </table>` : '<div class="det-vazio">Nenhuma reunião registrada nesse dia.</div>'}
       <div class="det-nota">
-        <b>Validada</b> = concluída, com responsável diferente do dono do negócio e dentro do filtro de Reunião Validada — é o número que o card conta.
+        <b>Agendada</b> = negócio nos funis Navigator/MGM e quem agendou é do time${
+          (r.time || []).length ? ` (${r.time.map(n => esc(n)).join(', ')})` : ''} — não importa de quem é o negócio.
+        ${r.excluidos ? `Atividade com <b>${esc(r.excluidos)}</b> como responsável não conta: é a cópia que o Pipedrive gera para quem conduz.` : ''}
+        <b>Validada</b> = concluída, dentro do filtro de Reunião Validada e em negócio de <b>${esc(DONO_REU)}</b>, que é quem conduz.
         <b>Não validada</b> = concluída, mas reprovada em uma dessas duas regras.
         <b>Pendente</b> = ainda não marcada como concluída.
-        Conta toda reunião em negócio de <b>${esc(DONO_REU)}</b>, que é quem conduz — não importa quem agendou.
-        ${r.excluidos ? `Reuniões com <b>${esc(r.excluidos)}</b> como responsável ficam de fora.` : ''}
+        Toda validada é também agendada — o primeiro número sempre contém o segundo.
         ${dup > 0 ? `<br><b>${dup}</b> atividade(s) duplicada(s) no mesmo negócio foram ocultadas — no Pipedrive existe mais de uma para o mesmo negócio neste dia.` : ''}
         ${r.fora_escopo > 0 ? `<br><b>${r.fora_escopo}</b> reunião(ões) do mês ficaram de fora por estarem em funil que não é Navigator nem MGM.` : ''}
-        ${r.fora_dono > 0 ? `<br><b>${r.fora_dono}</b> reunião(ões) do mês ficaram de fora por serem em negócio de outra pessoa.` : ''}
+        ${r.fora_time > 0 ? `<br><b>${r.fora_time}</b> reunião(ões) do mês ficaram de fora porque quem agendou não está no time${
+          Object.keys(r.responsaveis_fora || {}).length
+            ? ': ' + Object.entries(r.responsaveis_fora).slice(0, 6)
+                .map(([n, q]) => `${esc(n)} (${N(q)})`).join(', ') : ''}.` : ''}
       </div>
     </div>`;
 }
