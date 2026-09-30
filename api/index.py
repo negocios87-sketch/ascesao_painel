@@ -2793,6 +2793,12 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .fc-det .tit a{color:var(--navy);text-decoration:none;font-weight:600}
   .fc-det .tit a:hover{text-decoration:underline}
   .fc-det .falta{color:var(--red);font-weight:700}
+  .fc-det th.ord{cursor:pointer;user-select:none;white-space:nowrap;transition:color .12s}
+  .fc-det th.ord:hover{color:var(--navy)}
+  .fc-det th.ord .seta{margin-left:5px;font-size:8px;opacity:.35;letter-spacing:0}
+  .fc-det th.ord:hover .seta{opacity:.7}
+  .fc-det th.ord.ativo{color:var(--navy)}
+  .fc-det th.ord.ativo .seta{opacity:1;color:var(--gold)}
   .fr{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700;
       border:1px solid;white-space:nowrap}
   .fr-navigator{background:#F2F3F7;color:var(--navy);border-color:#D3D6E0}
@@ -3833,9 +3839,41 @@ function setView(v){
 // ── FORECAST DIA A DIA ────────────────────────────────────────
 let dadosForecast = null;
 
-function listaNegocios(itens, vazio){
-  if (!itens || !itens.length) return `<div class="fc-vazio">${vazio}</div>`;
-  const linhas = itens.map(i => `
+// ── lista de negócios, com ordenação por clique no cabeçalho ──
+// Cada tabela renderizada ganha um id e guarda os próprios itens aqui, para
+// reordenar sem ir buscar nada de novo no servidor.
+let LISTAS = {}, LISTA_SEQ = 0;
+
+const COLS_LISTA = [
+  { campo: 'titulo',        rot: 'Negócio',   num: false },
+  { campo: 'dono',          rot: 'Dono',      num: false },
+  { campo: 'frente',        rot: 'Frente',    num: false },
+  { campo: 'probabilidade', rot: 'Prob.',     num: true  },
+  { campo: 'valor',         rot: 'Valor',     num: true  },
+  { campo: 'ponderado',     rot: 'Ponderado', num: true  },
+];
+
+function ordenaItens(itens, campo, dir){
+  const col = COLS_LISTA.find(c => c.campo === campo) || COLS_LISTA[3];
+  const sinal = dir === 'asc' ? 1 : -1;
+  const vazio = v => v == null || v === '';
+  return itens.slice().sort((a, b) => {
+    const x = a[campo], y = b[campo];
+    // sem valor preenchido vai sempre para o fim, nas duas direções
+    if (vazio(x) && vazio(y)) return (b.ponderado || 0) - (a.ponderado || 0);
+    if (vazio(x)) return 1;
+    if (vazio(y)) return -1;
+    const c = col.num ? Number(x) - Number(y)
+                      : String(x).localeCompare(String(y), 'pt-BR');
+    if (c) return c * sinal;
+    return (b.ponderado || 0) - (a.ponderado || 0);   // desempate
+  });
+}
+
+function corpoLista(id){
+  const st = LISTAS[id];
+  if (!st) return '';
+  return ordenaItens(st.itens, st.campo, st.dir).map(i => `
     <tr>
       <td class="tit"><a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)} ↗</a></td>
       <td>${esc(i.dono)}</td>
@@ -3845,13 +3883,43 @@ function listaNegocios(itens, vazio){
       <td class="num">${R(i.valor)}</td>
       <td class="num"><b>${i.ponderado ? R(i.ponderado) : '<span class="zero">—</span>'}</b></td>
     </tr>`).join('');
+}
+
+function cabecalhoLista(id){
+  const st = LISTAS[id];
+  return COLS_LISTA.map(c => {
+    const ativo = st.campo === c.campo;
+    const seta = ativo ? (st.dir === 'asc' ? '▲' : '▼') : '⇅';
+    return `<th class="ord${c.num ? ' num' : ''}${ativo ? ' ativo' : ''}"
+        onclick="ordenarLista('${id}','${c.campo}')"
+        title="ordenar por ${c.rot}">${c.rot}<span class="seta">${seta}</span></th>`;
+  }).join('');
+}
+
+function ordenarLista(id, campo){
+  const st = LISTAS[id];
+  if (!st) return;
+  if (st.campo === campo) {
+    st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    st.campo = campo;
+    // texto começa A→Z; número começa do maior para o menor
+    st.dir = (COLS_LISTA.find(c => c.campo === campo) || {}).num ? 'desc' : 'asc';
+  }
+  const t = document.getElementById(id);
+  if (!t) return;
+  t.querySelector('thead tr').innerHTML = cabecalhoLista(id);
+  t.querySelector('tbody').innerHTML = corpoLista(id);
+}
+
+function listaNegocios(itens, vazio){
+  if (!itens || !itens.length) return `<div class="fc-vazio">${vazio}</div>`;
+  const id = 'lst' + (++LISTA_SEQ);
+  LISTAS[id] = { itens, campo: 'probabilidade', dir: 'desc' };
   return `
-    <table class="fc-det">
-      <thead><tr>
-        <th>Negócio</th><th>Dono</th><th>Frente</th>
-        <th class="num">Prob.</th><th class="num">Valor</th><th class="num">Ponderado</th>
-      </tr></thead>
-      <tbody>${linhas}</tbody>
+    <table class="fc-det" id="${id}">
+      <thead><tr>${cabecalhoLista(id)}</tr></thead>
+      <tbody>${corpoLista(id)}</tbody>
     </table>`;
 }
 
@@ -3871,6 +3939,7 @@ function toggleDia(i){
 
 function renderForecast(d){
   dadosForecast = d;
+  LISTAS = {};              // some com as tabelas do render anterior
   const p = d.periodo, t = d.total;
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
   const clsProj = (t.pct_projecao != null && t.pct_projecao >= 100) ? 'pos' : 'neg';
