@@ -65,6 +65,25 @@ SDRS_LISTA    = os.environ.get("SDRS",    "Raphaela Moutinho")
 # As linhas das outras closers são meta individual, de comissionamento — somar
 # tudo inflaria a meta do time. Vazio volta ao comportamento antigo (somar todas).
 META_PESSOA = os.environ.get("META_PESSOA", "Denise Mussolin")
+
+# Metas individuais de reserva, para quem não tem linha de closer na planilha
+# METAS (ex.: quem acumula papel e está lá só com meta de reunião).
+# Formato: "Nome=valor,Nome=valor". A planilha SEMPRE vence quando tem a pessoa.
+METAS_CLOSERS = os.environ.get("METAS_CLOSERS", "Mylena Oliveira=500000")
+
+
+def metas_closers_config():
+    """{nome_normalizado: valor} do METAS_CLOSERS."""
+    out = {}
+    for par in str(METAS_CLOSERS).split(","):
+        if "=" not in par:
+            continue
+        nome, _, valor = par.partition("=")
+        n = norm(nome)
+        v = to_num_br(valor)
+        if n and v:
+            out[n] = v
+    return out
 # Só as pendências deste dono aparecem na seção "Pipe a arrumar" (vazio = todos)
 # Donos cujo pipe entra na lista "Pipe a arrumar". Aceita lista separada por vírgula.
 PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin,Mylena Oliveira,Alessandra Costa")
@@ -1527,10 +1546,17 @@ def calcular_navigator(mes=None, ano=None):
     # de reunião) ficava sem meta aqui e aparecia com "—".
     lista_closers = _lista_norm(CLOSERS_LISTA)
     metas_por_nome = {norm(c["nome"]): c["meta"] for c in closers_meta}
+    origem_meta = {norm(c["nome"]): "planilha (linha de closer)" for c in closers_meta}
     for m in metas:
         nn = m["nome_norm"]
-        if nn in lista_closers and m["meta_fin"] > 0:
-            metas_por_nome.setdefault(nn, arred(m["meta_fin"]))
+        if nn in lista_closers and m["meta_fin"] > 0 and nn not in metas_por_nome:
+            metas_por_nome[nn] = arred(m["meta_fin"])
+            origem_meta[nn] = "planilha (qualquer linha com meta financeira)"
+    # último recurso: a configuração manual, para quem não tem linha na planilha
+    for nn, v in metas_closers_config().items():
+        if nn in lista_closers and nn not in metas_por_nome:
+            metas_por_nome[nn] = arred(v)
+            origem_meta[nn] = "METAS_CLOSERS (não achei na planilha)"
 
     # Todo closer configurado entra na tabela, mesmo sem nenhuma venda ainda —
     # senão quem acabou de chegar some do painel até fechar o primeiro negócio.
@@ -1556,6 +1582,7 @@ def calcular_navigator(mes=None, ano=None):
             "ticket": arred(safe_div(v["bruto"], v["qtd"])) if v["qtd"] else 0.0,
             "aberto_hoje": arred(v["aberto_hoje"]),
             "previsto_hoje": arred(v["previsto_hoje"]),
+            "origem_meta": origem_meta.get(norm(nome)),
         })
     fora_da_equipe = []
     if lista_closers:
@@ -2501,6 +2528,41 @@ def health_payload():
     })
 
 
+def diagnostico_metas():
+    """De onde veio a meta de cada closer — planilha, configuração, ou nenhuma."""
+    try:
+        hoje = hoje_br()
+        metas = buscar_metas(hoje.year, hoje.month)
+        colab = buscar_colaboradores(hoje.month, hoje.year)
+    except Exception as e:
+        return {"erro": f"{type(e).__name__}: {e}"}
+
+    meta_equipe, individuais, soma = meta_do_mes(metas, colab)
+    da_planilha = {norm(c["nome"]): c["meta"] for c in individuais}
+    cfg = metas_closers_config()
+    linhas = []
+    for nn in sorted(_lista_norm(CLOSERS_LISTA)):
+        bruto = next((m for m in metas if m["nome_norm"] == nn), None)
+        if nn in da_planilha:
+            v, origem = da_planilha[nn], "planilha (linha de closer)"
+        elif bruto and bruto["meta_fin"] > 0:
+            v, origem = arred(bruto["meta_fin"]), "planilha (linha com meta de reunião também)"
+        elif nn in cfg:
+            v, origem = arred(cfg[nn]), "METAS_CLOSERS"
+        else:
+            v, origem = None, "SEM META — não achei em lugar nenhum"
+        linhas.append({"nome": nn.title(), "meta": v, "origem": origem,
+                       "na_planilha": bool(bruto),
+                       "meta_reu_na_planilha": (bruto or {}).get("meta_reu")})
+    return {
+        "meta_da_equipe": meta_equipe,
+        "de_onde_vem": f"linha de {META_PESSOA} na planilha METAS",
+        "soma_das_individuais_NAO_USAR": soma,
+        "closers": linhas,
+        "nomes_na_planilha_METAS": sorted({m["nome"] for m in metas if m.get("nome")}),
+    }
+
+
 def diagnostico_reunioes():
     """
     Por que o número de reuniões está no valor que está.
@@ -2536,6 +2598,7 @@ def diagnostico_reunioes():
         "aviso": ("Nome(s) configurado(s) que não existem no Pipedrive com essa grafia — "
                   "toda reunião dessa pessoa está sendo descartada."
                   if nao_casou else None),
+        "metas_closers": diagnostico_metas(),
         "dono_reuniao": DONO_REUNIAO,
         "dono_encontrado": DONO_REUNIAO in users.values(),
         "filtro_atividades": FILTER_ACTIVITIES,
