@@ -1522,7 +1522,27 @@ def calcular_navigator(mes=None, ano=None):
         if pr in (20, 50, 70):
             acc["previsto_hoje"] += v * (pr / 100.0)
 
+    # Meta individual de cada closer. Vem da planilha pelo NOME da pessoa, sem o
+    # filtro de "meta_reu == 0" — quem acumula papel (closer que também tem meta
+    # de reunião) ficava sem meta aqui e aparecia com "—".
+    lista_closers = _lista_norm(CLOSERS_LISTA)
     metas_por_nome = {norm(c["nome"]): c["meta"] for c in closers_meta}
+    for m in metas:
+        nn = m["nome_norm"]
+        if nn in lista_closers and m["meta_fin"] > 0:
+            metas_por_nome.setdefault(nn, arred(m["meta_fin"]))
+
+    # Todo closer configurado entra na tabela, mesmo sem nenhuma venda ainda —
+    # senão quem acabou de chegar some do painel até fechar o primeiro negócio.
+    nome_real = {norm(nome): nome for nome in
+                 (users.values() if isinstance(users, dict) else [])}
+    for nn in lista_closers:
+        nome_exib = nome_real.get(nn) or nn.title()
+        if norm(nome_exib) not in {norm(k) for k in por_closer}:
+            por_closer.setdefault(nome_exib, {
+                "nome": nome_exib, "bruto": 0.0, "multi": 0.0, "qtd": 0,
+                "aberto_hoje": 0.0, "previsto_hoje": 0.0})
+
     closers = []
     for nome, v in por_closer.items():
         meta_ind = metas_por_nome.get(norm(nome), 0.0)
@@ -1537,13 +1557,12 @@ def calcular_navigator(mes=None, ano=None):
             "aberto_hoje": arred(v["aberto_hoje"]),
             "previsto_hoje": arred(v["previsto_hoje"]),
         })
-    lista_closers = _lista_norm(CLOSERS_LISTA)
     fora_da_equipe = []
     if lista_closers:
         fora_da_equipe = [c for c in closers if norm(c["nome"]) not in lista_closers
                           and (c["qtd"] or c["real_bruto"])]
         closers = [c for c in closers if norm(c["nome"]) in lista_closers]
-    closers.sort(key=lambda x: -x["real_multi"])
+    closers.sort(key=lambda x: (-x["real_multi"], -(x["meta"] or 0), x["nome"]))
     fora_da_equipe.sort(key=lambda x: -x["real_bruto"])
 
     # A diferença entre as duas réguas: quem ganhou no funil sem estar em CLOSERS.
@@ -2626,6 +2645,8 @@ PAGINA_HTML = r"""<!DOCTYPE html>
                     padding:12px 16px;font-size:12px;box-shadow:var(--shadow)}
   details.meta-comp summary{cursor:pointer;font-weight:600;color:var(--navy);font-size:12px;outline:none}
   details.meta-comp ul{margin:10px 0 0 18px;color:var(--muted);line-height:1.8}
+  .closers .hint-bl{display:block;font-size:9px;font-weight:600;color:var(--muted);
+                    letter-spacing:.3px;text-transform:none;margin-top:1px}
   .rodape{text-align:right;color:var(--muted);font-size:11px;font-style:italic;margin-top:14px}
 
 
@@ -3146,7 +3167,7 @@ function render(d){
     const tb = d.closers.map(c => `
       <tr>
         <td>${c.nome}</td>
-        <td>${c.meta > 0 ? R(c.meta) : '<span class="zero">—</span>'}</td>
+        <td>${c.meta > 0 ? R(c.meta) : '<span class="zero">sem meta na planilha</span>'}</td>
         <td>${money(c.real_bruto)}</td>
         <td>${money(c.real_multi)}</td>
         <td>${pctTag(c.pct)}</td>
@@ -3172,7 +3193,7 @@ function render(d){
 
     closersHtml = `
     <div class="block-title">Por Closer<div class="rule"></div>
-      <span class="peso-nota">${(eq.lista || []).join(' · ')}</span></div>
+      <span class="peso-nota">meta individual = comissionamento · não soma na meta da equipe</span></div>
     ${notaEquipe}
     <div class="card">
       <div class="table-scroll">
@@ -3186,10 +3207,10 @@ function render(d){
             ${tb}
             <tr class="total">
               <td>TOTAL</td>
-              <td>${t.meta > 0 ? R(t.meta) : '—'}</td>
+              <td>${R(m.meta_mes)}<span class="hint-bl">meta da equipe</span></td>
               <td>${R(t.bruto)}</td>
               <td>${R(t.multi)}</td>
-              <td>${pctTag(t.meta > 0 ? t.multi/t.meta*100 : null)}</td>
+              <td>${pctTag(m.meta_mes > 0 ? t.multi/m.meta_mes*100 : null)}</td>
               <td>${N(t.qtd)}</td>
               <td>${R(t.qtd ? t.bruto/t.qtd : 0)}</td>
               <td>${R(t.prev)}</td>
