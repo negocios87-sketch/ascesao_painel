@@ -58,14 +58,22 @@ EXCLUIR_PESSOAS = {"priscila ribeiro"}
 ROTULO_FUNIL = os.environ.get("ROTULO_FUNIL", "ASCENSÃO/MGM")
 
 # Quem aparece em cada tabela. Nomes separados por vírgula, como estão no Pipedrive.
-CLOSERS_LISTA = os.environ.get("CLOSERS", "Denise Mussolin,Mylena Oliveira")
+CLOSERS_LISTA = os.environ.get("CLOSERS", "Denise Mussolin,Mylena Oliveira,Alessandra Costa")
 SDRS_LISTA    = os.environ.get("SDRS",    "Raphaela Moutinho")
+
+# A Meta Mês da EQUIPE vive numa linha só da planilha METAS (a da gestora).
+# As linhas das outras closers são meta individual, de comissionamento — somar
+# tudo inflaria a meta do time. Vazio volta ao comportamento antigo (somar todas).
+META_PESSOA = os.environ.get("META_PESSOA", "Denise Mussolin")
 # Só as pendências deste dono aparecem na seção "Pipe a arrumar" (vazio = todos)
-PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin")
+# Donos cujo pipe entra na lista "Pipe a arrumar". Aceita lista separada por vírgula.
+PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin,Mylena Oliveira,Alessandra Costa")
 # Responsáveis ignorados na contagem E no detalhamento de reuniões
 EXCLUIR_REU = os.environ.get("EXCLUIR_REU", "Denise Mussolin")
 # Quem FAZ a reunião — o negócio precisa ser dela para a reunião validar.
 # (o responsável pela atividade é quem AGENDOU, normalmente a SDR)
+# Quem CONDUZ a reunião — é o dono do negócio que valida a reunião como realizada.
+# Aceita lista: com mais de uma closer conduzindo, separe por vírgula.
 DONO_REUNIAO = os.environ.get("DONO_REUNIAO", "Denise Mussolin")
 
 # Quem pode AGENDAR para a reunião contar. Vazio = CLOSERS + SDRS.
@@ -714,6 +722,40 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
     return out
 
 
+def meta_do_mes(metas, colab):
+    """
+    (meta da equipe, metas individuais, soma das individuais).
+
+    A planilha METAS tem uma linha por pessoa. A meta do TIME é a linha de
+    META_PESSOA; as demais são individuais, de comissionamento, e NÃO entram na
+    soma — por isso a meta do mês não é o somatório das closers.
+    """
+    subareas = _subareas()
+    nome_to_sub = {c["nome_norm"]: norm(c["subarea"]) for c in colab}
+    alvo = norm(META_PESSOA)
+    soma, individuais, da_pessoa = 0.0, [], None
+
+    for m in metas:
+        nn = m["nome_norm"]
+        if not nn or nn in EXCLUIR_PESSOAS:
+            continue
+        if not (m["meta_reu"] == 0 and m["meta_fin"] > 0):   # closer
+            continue
+        if nome_to_sub.get(nn) not in subareas:
+            continue
+        soma += m["meta_fin"]
+        individuais.append({"nome": m["nome"], "meta": arred(m["meta_fin"]),
+                            "e_da_equipe": bool(alvo) and nn == alvo})
+        if alvo and nn == alvo:
+            da_pessoa = m["meta_fin"]
+
+    meta = da_pessoa if (alvo and da_pessoa is not None) else soma
+    if META_FIXA:
+        meta = to_num_br(META_FIXA)
+    individuais.sort(key=lambda x: (not x["e_da_equipe"], -x["meta"]))
+    return arred(meta), individuais, arred(soma)
+
+
 # ── CÁLCULO ───────────────────────────────────────────────────
 def bucket_dias(deals_abertos, dias):
     """Buckets 20/50/70 dos abertos cuja data prevista cai em `dias` (set ou lista)."""
@@ -768,10 +810,10 @@ def montar_pendencias(abertos, users, so_do_dono=""):
       2. sem_probabilidade -> entra em "Em Aberto", fica fora do "Previsto"
       3. prob_fora         -> idem; a regua do painel so pondera 20/50/70
     """
-    dono_alvo = norm(so_do_dono)
+    donos_alvo = set(_lista_norm(so_do_dono))
     itens = []
     for d in abertos:
-        if dono_alvo and norm(owner_name(d, users)) != dono_alvo:
+        if donos_alvo and norm(owner_name(d, users)) not in donos_alvo:
             continue
         dt = str(d.get("expected_close_date") or "")[:10]
         pr = d.get("probability")
@@ -801,7 +843,7 @@ def montar_pendencias(abertos, users, so_do_dono=""):
     itens.sort(key=lambda x: (ordem[x["motivo"]], -x["valor"]))
 
     considerados = [d for d in abertos
-                    if not dono_alvo or norm(owner_name(d, users)) == dono_alvo]
+                    if not donos_alvo or norm(owner_name(d, users)) in donos_alvo]
 
     resumo = {}
     for k, label in MOTIVOS.items():
@@ -917,7 +959,10 @@ ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia,Inscrição em Andame
 # batendo com a meta da Denise na planilha METAS.
 METAS_FRENTES = {
     (2026,  9): {"navigator": 340000, "mgm": 120000, "renovacao": 40000},
-    (2026, 10): {"navigator": 313600, "mgm": 127300, "renovacao": 47300},
+    # Out/26: time passou a ter 3 closers (Denise, Mylena, Alessandra) e a meta
+    # da equipe subiu para 642k — as três frentes somam exatamente isso.
+    (2026, 10): {"navigator": 451500, "mgm": 150500, "renovacao": 40000},
+    # Nov e Dez ainda são a projeção antiga, montada com 2 closers e meta menor.
     (2026, 11): {"navigator": 327300, "mgm": 134500, "renovacao": 54500},
     (2026, 12): {"navigator": 340900, "mgm": 141800, "renovacao": 61800},
 }
@@ -1093,7 +1138,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
     Descartes ficam contados e NOMEADOS: "fora_escopo" (negócio em outro funil) e
     "fora_time" (quem agendou não está na lista) — com responsaveis_fora dizendo quem.
     """
-    dono_alvo = norm(DONO_REUNIAO)
+    donos_alvo = set(_lista_norm(DONO_REUNIAO))
 
     time_reu = set(_lista_norm(TIME_REUNIAO))
     if not time_reu:
@@ -1110,7 +1155,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
     responsaveis_fora = {}
     contagem = {d: {"agendadas": 0, "realizadas": 0} for d in dias}
     detalhe = {d: [] for d in dias}
-    if not uids_time and not dono_alvo:
+    if not uids_time and not donos_alvo:
         return {"contagem": contagem, "detalhe": detalhe, "conversao": {},
                 "fora_escopo": 0, "fora_time": 0, "responsaveis_fora": {},
                 "time": sorted(time_reu)}
@@ -1149,7 +1194,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
 
         dono_uid = str(info.get("owner", ""))
         nome_dono = nome_por_uid.get(dono_uid, "")
-        eh_do_dono = bool(dono_alvo) and norm(nome_dono) == dono_alvo
+        eh_do_dono = bool(donos_alvo) and norm(nome_dono) in donos_alvo
 
         # 2) quem AGENDOU tem que ser do time de Ascensão.
         #    Quem está em EXCLUIR_REU cai fora sempre — a exclusão vence inclusive
@@ -1175,7 +1220,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
             status = "pendente"
         elif deal_id not in ids_rv:
             status, motivo = "nao_validada", "fora do filtro de Reunião Validada"
-        elif dono_alvo and not eh_do_dono:
+        elif donos_alvo and not eh_do_dono:
             status, motivo = "nao_validada", f"negócio não é de {DONO_REUNIAO}"
         else:
             status = "realizada"
@@ -1249,22 +1294,8 @@ def calcular_navigator(mes=None, ano=None):
     colab = buscar_colaboradores(mes, ano)
     subareas = _subareas()
 
-    # ── Meta Mês = soma dos CLOSERS da Ascensão ────────────────
-    nome_to_sub = {c["nome_norm"]: norm(c["subarea"]) for c in colab}
-    meta_mes, closers_meta = 0.0, []
-    for m in metas:
-        nn = m["nome_norm"]
-        if not nn or nn in EXCLUIR_PESSOAS:
-            continue
-        if not (m["meta_reu"] == 0 and m["meta_fin"] > 0):   # closer
-            continue
-        if nome_to_sub.get(nn) not in subareas:
-            continue
-        meta_mes += m["meta_fin"]
-        closers_meta.append({"nome": m["nome"], "meta": arred(m["meta_fin"])})
-
-    if META_FIXA:
-        meta_mes = to_num_br(META_FIXA)
+    # ── Meta Mês = a linha de META_PESSOA na planilha ─────────
+    meta_mes, closers_meta, soma_individuais = meta_do_mes(metas, colab)
 
     # ── Dias úteis ────────────────────────────────────────────
     du_calc = du_mes_total(ano, mes, feriados)
@@ -1868,11 +1899,7 @@ def calcular_resumo(mes=None, ano=None):
             "atual": (a_ == ano and m_ == mes),
         })
 
-    meta_planilha = sum(
-        m["meta_fin"] for m in metas_sheet
-        if m["meta_reu"] == 0 and m["meta_fin"] > 0 and m["nome_norm"] not in EXCLUIR_PESSOAS
-        and norm(next((c["subarea"] for c in buscar_colaboradores(mes, ano)
-                       if c["nome_norm"] == m["nome_norm"]), "")) in _subareas())
+    meta_planilha = meta_do_mes(metas_sheet, buscar_colaboradores(mes, ano))[0]
 
     alertas = []
     if not filtrou_etapa and ETAPA_PREVISAO:
@@ -1890,7 +1917,7 @@ def calcular_resumo(mes=None, ano=None):
     if metas_mes and meta_planilha and abs(meta_planilha - total_meta) > 1:
         alertas.append(f"As metas por frente somam R$ {total_meta:,.0f}".replace(",", ".")
                        + f", mas a planilha METAS traz R$ {meta_planilha:,.0f}".replace(",", ".")
-                       + " para os closers da Ascensão. Vale conferir qual das duas manda.")
+                       + f" na linha de {META_PESSOA}. Vale conferir qual das duas manda.")
 
     return {
         "periodo": {
@@ -1935,19 +1962,7 @@ def calcular_graficos(mes=None, ano=None):
     subareas = _subareas()
 
     # meta consolidada do mês (mesma régua do Painel do Mês)
-    nome_to_sub = {c["nome_norm"]: norm(c["subarea"]) for c in colab}
-    meta_mes = 0.0
-    for m in metas_sheet:
-        nn = m["nome_norm"]
-        if not nn or nn in EXCLUIR_PESSOAS:
-            continue
-        if not (m["meta_reu"] == 0 and m["meta_fin"] > 0):
-            continue
-        if nome_to_sub.get(nn) not in subareas:
-            continue
-        meta_mes += m["meta_fin"]
-    if META_FIXA:
-        meta_mes = to_num_br(META_FIXA)
+    meta_mes = meta_do_mes(metas_sheet, colab)[0]
 
     du_calc = du_mes_total(ano, mes, feriados)
     du_sheet = next((m["dias_uteis"] for m in metas_sheet if m["dias_uteis"] > 0), 0)
@@ -2211,19 +2226,8 @@ def calcular_forecast(mes=None, ano=None):
     colab = buscar_colaboradores(mes, ano)
     subareas = _subareas()
 
-    nome_to_sub = {c["nome_norm"]: norm(c["subarea"]) for c in colab}
-    meta_mes = 0.0
-    for m in metas_sheet:
-        nn = m["nome_norm"]
-        if not nn or nn in EXCLUIR_PESSOAS:
-            continue
-        if not (m["meta_reu"] == 0 and m["meta_fin"] > 0):
-            continue
-        if nome_to_sub.get(nn) not in subareas:
-            continue
-        meta_mes += m["meta_fin"]
-    if META_FIXA:
-        meta_mes = to_num_br(META_FIXA)
+    # meta consolidada do mês (mesma régua do Painel do Mês)
+    meta_mes = meta_do_mes(metas_sheet, colab)[0]
 
     du_calc = du_mes_total(ano, mes, feriados)
     du_sheet = next((m["dias_uteis"] for m in metas_sheet if m["dias_uteis"] > 0), 0)
@@ -3288,8 +3292,13 @@ function render(d){
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${a}</div>`).join('');
   const comp = (d.meta_composicao || []).length
     ? `<details class="meta-comp">
-         <summary>Como a Meta Mês de ${R(m.meta_mes)} foi montada (${d.meta_composicao.length} closers)</summary>
-         <ul>${d.meta_composicao.map(c => `<li>${c.nome} — ${R(c.meta)}</li>`).join('')}</ul>
+         <summary>De onde vem a Meta Mês de ${R(m.meta_mes)} (${d.meta_composicao.length} closer(s) na planilha)</summary>
+         <ul>${d.meta_composicao.map(c => `<li>${esc(c.nome)} — ${R(c.meta)}${
+             c.e_da_equipe ? ' <b>← meta da EQUIPE, é esta que o painel usa</b>'
+                           : ' <span class="hint">individual, só para comissionamento</span>'}</li>`).join('')}</ul>
+         <p style="margin-top:8px;color:var(--muted);font-size:11px">
+           As metas individuais <b>não somam</b> na meta do time: elas existem para
+           comissionamento e já estão contidas na meta da equipe.</p>
        </details>`
     : '';
 
