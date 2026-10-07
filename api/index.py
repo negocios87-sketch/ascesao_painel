@@ -89,20 +89,22 @@ def metas_closers_config():
 PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin,Mylena Oliveira,Alessandra Costa")
 # Responsáveis ignorados na contagem E no detalhamento de reuniões
 EXCLUIR_REU = os.environ.get("EXCLUIR_REU", "Denise Mussolin")
-# Quem FAZ a reunião — o negócio precisa ser dela para a reunião validar.
-# (o responsável pela atividade é quem AGENDOU, normalmente a SDR)
-# Quem CONDUZ a reunião — é o dono do negócio que valida a reunião como realizada.
-# Aceita lista: com mais de uma closer conduzindo, separe por vírgula.
-DONO_REUNIAO = os.environ.get("DONO_REUNIAO", "Denise Mussolin")
+# Quem CONDUZ a reunião — dono do negócio. Desde out/26 é FILTRO DURO nos quatro
+# cards, não só no de validada: reunião em negócio de fora do time não entra em
+# card nenhum. Aceita lista separada por vírgula.
+DONO_REUNIAO = os.environ.get(
+    "DONO_REUNIAO", "Denise Mussolin,Alessandra Costa,Mylena Oliveira")
 
 # Quem pode AGENDAR para a reunião contar. Vazio = CLOSERS + SDRS.
 # É o time de Ascensão: a régua de "agendada" é funil + responsável do time.
 # ATENÇÃO: deixar vazio faz a lista virar CLOSERS + SDRS, e aí toda closer nova
 # vira "quem agenda" sem ninguém pedir. Por isso aqui é explícito.
 TIME_REUNIAO = os.environ.get("TIME_REUNIAO", "Raphaela Moutinho,Mylena Oliveira")
-# Rede de segurança: reunião em negócio do DONO_REUNIAO conta mesmo que quem
-# agendou esteja fora da lista — impede que a régua nova derrube número antigo.
-REU_SEMPRE_DONO = os.environ.get("REU_SEMPRE_DONO", "1") not in ("0", "false", "")
+# Rede de segurança antiga: reunião em negócio do DONO_REUNIAO contava mesmo que
+# quem agendou estivesse fora da lista. Com DONO_REUNIAO virando uma lista de três
+# closers, isso deixa QUALQUER pessoa agendar — é exatamente o vazamento da
+# Alessandra de novo, pela porta dos fundos. Por isso o padrão agora é desligado.
+REU_SEMPRE_DONO = os.environ.get("REU_SEMPRE_DONO", "0") not in ("0", "false", "")
 
 # Usados só no cálculo de SDR (mesmos filtros e campo do painel gerente_comercial)
 FILTER_ACTIVITIES = int(os.environ.get("FILTER_ACTIVITIES", "1310451"))
@@ -114,6 +116,11 @@ CF_QUALIFICADOR   = "a6f13cc27c8d041f3af4091283ce0d4fe0913875"
 
 def _lista_norm(raw):
     return [norm(x) for x in raw.split(",") if x.strip()]
+
+
+def _lista_nomes(raw):
+    """A mesma lista, mas com os nomes como foram escritos — para exibir na tela."""
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
 def _subareas():
@@ -1142,22 +1149,29 @@ def so_em_negociacao(deals):
 
 def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=None):
     """
-    Reuniões por dia. Duas réguas diferentes, de propósito:
+    Reuniões por dia. UM universo e três recortes dentro dele.
 
-      AGENDADA  = atividade com negócio vinculado, em funil do escopo (Navigator/MGM),
-                  com due_date naquele dia (BRT), e cujo RESPONSÁVEL (quem agendou)
-                  é do time de Ascensão MENOS quem está em EXCLUIR_REU.
-                  Não importa de quem é o negócio. Deduplicada por dia + negócio.
+    UNIVERSO ("na agenda") — tudo abaixo tem que ser verdade:
+      1. atividade com negócio vinculado
+      2. negócio em funil do escopo (Navigator / MGM)
+      3. due_date naquele dia, já convertido para BRT
+      4. RESPONSÁVEL (quem agendou) está em TIME_REUNIAO, menos EXCLUIR_REU
+      5. DONO do negócio está em DONO_REUNIAO
+      6. deduplicada por (dia, negócio)
 
-      REALIZADA = subconjunto das agendadas: concluída, dentro do filtro de Reunião
-                  Validada, e em negócio de DONO_REUNIAO (a Denise, que conduz).
+    Dentro do universo, três contagens:
+      agendadas  = o universo inteiro, qualquer status
+      realizadas = concluída E dentro do filtro de Reunião Validada
+      pendentes  = ainda não concluída
 
-    Por isso realizadas ⊆ agendadas sempre. A régua de agendada é larga porque a
-    pergunta é "quanta reunião o time colocou na agenda"; a de realizada é estreita
-    porque a pergunta é "quanta reunião de verdade aconteceu".
+    Sempre: realizadas + pendentes + (concluídas fora do filtro RV) = agendadas.
 
-    Descartes ficam contados e NOMEADOS: "fora_escopo" (negócio em outro funil) e
-    "fora_time" (quem agendou não está na lista) — com responsaveis_fora dizendo quem.
+    A regra 5 virou filtro DURO em out/26 (antes só pesava na validada): reunião em
+    negócio que não é de nenhuma closer do time não entra em card nenhum.
+
+    Descartes ficam contados e NOMEADOS: "fora_escopo" (negócio em outro funil),
+    "fora_time" (quem agendou não está na lista, com responsaveis_fora dizendo quem)
+    e "fora_dono" (o negócio não é de ninguém do time, com donos_fora dizendo de quem).
     """
     donos_alvo = set(_lista_norm(DONO_REUNIAO))
 
@@ -1172,14 +1186,15 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
     uids_excluidos = {str(uid) for uid, nome in users.items() if norm(nome) in excluidos}
     nome_por_uid = {str(uid): nome for uid, nome in users.items()}
 
-    fora_escopo = fora_time = 0
-    responsaveis_fora = {}
-    contagem = {d: {"agendadas": 0, "realizadas": 0} for d in dias}
+    fora_escopo = fora_time = fora_dono = dono_incerto = 0
+    responsaveis_fora, donos_fora = {}, {}
+    contagem = {d: {"agendadas": 0, "realizadas": 0, "pendentes": 0} for d in dias}
     detalhe = {d: [] for d in dias}
     if not uids_time and not donos_alvo:
         return {"contagem": contagem, "detalhe": detalhe, "conversao": {},
-                "fora_escopo": 0, "fora_time": 0, "responsaveis_fora": {},
-                "time": sorted(time_reu)}
+                "fora_escopo": 0, "fora_time": 0, "fora_dono": 0, "dono_incerto": 0,
+                "responsaveis_fora": {}, "donos_fora": {},
+                "time": sorted(time_reu), "donos": sorted(donos_alvo)}
 
     acts = buscar_activities_mes(mes, ano)
     ids_rv, mapa_deal = buscar_deals_rv()
@@ -1226,23 +1241,37 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
             quem = nome_por_uid.get(resp_uid) or f"uid {resp_uid or '—'}"
             responsaveis_fora[quem] = responsaveis_fora.get(quem, 0) + 1
             continue
-        #    Rede de segurança: reunião em negócio do dono-alvo conta mesmo que quem
-        #    agendou não esteja na lista — desde que não esteja excluído.
+        #    Rede de segurança (desligada por padrão): ver REU_SEMPRE_DONO lá em cima.
         if resp_uid not in uids_time and not (REU_SEMPRE_DONO and eh_do_dono):
             fora_time += 1
             quem = nome_por_uid.get(resp_uid) or f"uid {resp_uid or '—'}"
             responsaveis_fora[quem] = responsaveis_fora.get(quem, 0) + 1
             continue
 
-        # ── status: realizada é o subconjunto estreito ────────
+        # 3) o NEGÓCIO tem que ser de uma closer do time. Filtro duro desde out/26:
+        #    vale para os quatro cards, não só para a validada.
+        #
+        #    PEGADINHA: o mapa de negócios não tem TODO negócio do Pipedrive — ele é
+        #    o filtro de Reunião Validada + os ganhos e abertos do mês. Negócio perdido
+        #    ou ganho em mês anterior pode não estar lá, e aí o dono vem vazio. Barrar
+        #    por "dono desconhecido" apagaria reunião de verdade, em silêncio. Então
+        #    só barro quando SEI de quem é o negócio; o resto conta e fica marcado,
+        #    para aparecer no rodapé do detalhamento em vez de sumir.
+        dono_conhecido = bool(nome_dono)
+        if donos_alvo and dono_conhecido and not eh_do_dono:
+            fora_dono += 1
+            donos_fora[nome_dono] = donos_fora.get(nome_dono, 0) + 1
+            continue
+        if donos_alvo and not dono_conhecido:
+            dono_incerto += 1
+
+        # ── status dentro do universo ─────────────────────────
         concluida = a.get("done") is True or a.get("status") == "done"
         motivo = None
         if not concluida:
             status = "pendente"
         elif deal_id not in ids_rv:
             status, motivo = "nao_validada", "fora do filtro de Reunião Validada"
-        elif donos_alvo and not eh_do_dono:
-            status, motivo = "nao_validada", f"negócio não é de {DONO_REUNIAO}"
         else:
             status = "realizada"
 
@@ -1277,6 +1306,7 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
         contagem[dia] = {
             "agendadas": len(lista),
             "realizadas": sum(1 for i in lista if i["status"] == "realizada"),
+            "pendentes":  sum(1 for i in lista if i["status"] == "pendente"),
             "duplicadas_ocultas": duplicadas[dia],
         }
 
@@ -1299,10 +1329,13 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
     }
 
     return {"contagem": contagem, "detalhe": detalhe, "conversao": conversao,
-            "fora_escopo": fora_escopo, "fora_time": fora_time,
+            "fora_escopo": fora_escopo, "fora_time": fora_time, "fora_dono": fora_dono,
+            "dono_incerto": dono_incerto,
             "responsaveis_fora": dict(sorted(responsaveis_fora.items(),
                                              key=lambda kv: -kv[1])),
-            "time": sorted(nome_por_uid[u] for u in uids_time)}
+            "donos_fora": dict(sorted(donos_fora.items(), key=lambda kv: -kv[1])),
+            "time": sorted(nome_por_uid[u] for u in uids_time),
+            "donos": sorted(nome for nome in users.values() if norm(nome) in donos_alvo)}
 
 
 def calcular_navigator(mes=None, ano=None):
@@ -1707,22 +1740,37 @@ def calcular_navigator(mes=None, ano=None):
         # o mês inteiro: os totais do mês, da semana e dos cards saem de uma chamada só
         dias_reu = sorted(set(dias_mes) | {ontem_str, hoje_str} | set(dias_semana))
         escopo = {pid} | ({PIPELINE_MGM} if PIPELINE_MGM else set())
+        # Os perdidos entram no mapa de negócios de propósito: agora que o dono é
+        # filtro duro, negócio fora do mapa vira "dono desconhecido". Perdido é
+        # exatamente o que faltava (não é ganho nem aberto) e já vem do cache.
+        try:
+            perdidos_reu = buscar_perdidos()
+        except Exception:
+            perdidos_reu = []
         reunioes = contar_reunioes(mes, ano, users, dias_reu,
-                                   deals_extra=ganhos + abertos_todos,
+                                   deals_extra=ganhos + abertos_todos + perdidos_reu,
                                    pipelines_escopo=escopo)
     except Exception as e:
         erro_reu = f"{type(e).__name__}: {e}"
 
     cont_reu = reunioes.get("contagem") or {}
+
+    def _soma_reu(dias_alvo, chave):
+        return sum((cont_reu.get(d) or {}).get(chave, 0) for d in dias_alvo)
+
     reu_mes = {
-        "agendadas":  sum((cont_reu.get(d) or {}).get("agendadas", 0)  for d in dias_mes),
-        "realizadas": sum((cont_reu.get(d) or {}).get("realizadas", 0) for d in dias_mes),
+        "agendadas":  _soma_reu(dias_mes, "agendadas"),
+        "realizadas": _soma_reu(dias_mes, "realizadas"),
+        "pendentes":  _soma_reu(dias_mes, "pendentes"),
     }
-    # futuras = depois de hoje (hoje tem card próprio)
+    # futuras = depois de hoje (hoje tem card próprio). O número do card é
+    # PENDENTES: reunião futura já concluída é erro de preenchimento, não agenda.
     dias_depois = [d for d in dias_mes if d > hoje_str]
     reu_futuras = {
-        "agendadas": sum((cont_reu.get(d) or {}).get("agendadas", 0) for d in dias_depois),
-        "dias": sum(1 for d in dias_depois if (cont_reu.get(d) or {}).get("agendadas", 0)),
+        "agendadas": _soma_reu(dias_depois, "agendadas"),
+        "pendentes": _soma_reu(dias_depois, "pendentes"),
+        "realizadas": _soma_reu(dias_depois, "realizadas"),
+        "dias": sum(1 for d in dias_depois if (cont_reu.get(d) or {}).get("pendentes", 0)),
     }
     # listas por trás dos cards "Total do mês" e "Futuras" (o dia entra no item,
     # porque aqui a lista cruza vários dias e sem ele não dá para ler)
@@ -1857,8 +1905,8 @@ def calcular_navigator(mes=None, ano=None):
         "equipe": equipe,
         "sdrs": sdrs,
         "reunioes": {
-            "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
-            "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0, "duplicadas_ocultas": 0}),
+            "hoje":  (reunioes.get("contagem") or {}).get(hoje_str,  {"agendadas": 0, "realizadas": 0, "pendentes": 0, "duplicadas_ocultas": 0}),
+            "ontem": (reunioes.get("contagem") or {}).get(ontem_str, {"agendadas": 0, "realizadas": 0, "pendentes": 0, "duplicadas_ocultas": 0}),
             "mes": reu_mes,
             "futuras": reu_futuras,
             "conversao": reunioes.get("conversao") or {
@@ -1869,9 +1917,13 @@ def calcular_navigator(mes=None, ano=None):
             "lista_futuras": lista_reu_fut,
             "excluidos": EXCLUIR_REU,
             "dono": DONO_REUNIAO,
+            "donos": (reunioes.get("donos") or _lista_nomes(DONO_REUNIAO)),
             "fora_escopo": (reunioes.get("fora_escopo") or 0),
             "fora_time": (reunioes.get("fora_time") or 0),
+            "fora_dono": (reunioes.get("fora_dono") or 0),
+            "dono_incerto": (reunioes.get("dono_incerto") or 0),
             "responsaveis_fora": (reunioes.get("responsaveis_fora") or {}),
+            "donos_fora": (reunioes.get("donos_fora") or {}),
             "time": (reunioes.get("time") or []),
         },
         "semana": {
@@ -2820,6 +2872,8 @@ PAGINA_HTML = r"""<!DOCTYPE html>
                       letter-spacing:.6px;text-transform:uppercase;line-height:1.2}
   .graf-total .gt-val{font-size:17px;font-weight:800;color:var(--navy);line-height:1.15;margin-top:1px}
   .graf-total .gt-pct{font-size:11px;font-weight:700;color:var(--muted)}
+  /* o qualificador ("c/ multi", "bruto") não pode gritar mais que o próprio rótulo */
+  .graf-total .gt-rot .gt-pct{font-size:9px;color:var(--gold)}
   .kcard .gt-eq{color:#43586F;font-weight:600}
   .graf-total .gt-sub{font-size:10px;color:var(--muted);line-height:1.3;margin-top:3px}
   .graf-total .gt-pos{color:#0D7A3E;font-weight:700}
@@ -3182,18 +3236,27 @@ function render(d){
   const detV = q => `<button class="btn-det" onclick="verVisao('${q}')">Detalhamento</button>`;
 
   // 1 ── REUNIÕES
+  // ATENÇÃO: os quatro cards têm réguas DIFERENTES, por decisão do Rodrigo (out/26).
+  // Por isso o mês pode ficar menor que o dia — não é bug, e o subtítulo de cada
+  // card diz em voz alta qual régua está sendo usada. Não "corrija" isso sem falar
+  // com ele: já foi reportado como bug uma vez e a resposta foi "é assim mesmo".
+  const donosReu = (reu.donos || []).join(', ') || esc(reu.dono || DONO_REU);
   const bReunioes = bloco('Reuniões',
-    `agendada = funil Navigator/MGM + quem agendou é do time · validada = conduzida por ${esc(reu.dono || DONO_REU)}`,
-    // número grande = AGENDADAS nos quatro, senão o mês fica menor que o dia
-    card('ontem', 'Último dia útil', N(reu.ontem.agendadas || 0),
-         `agendadas · ${N(reu.ontem.realizadas || 0)} validadas · ${fmtDia(p.ontem)}`, det('ontem')) +
+    `só funil Navigator/MGM, agendada por ${esc((reu.time || []).join(' ou ') || 'quem é do time')},
+     em negócio de ${esc(donosReu)} · cada card tem uma régua, dita no rodapé dele`,
+    card('ontem', 'Último dia útil', N(reu.ontem.realizadas || 0),
+         `<b>realizadas</b> · de ${N(reu.ontem.agendadas || 0)} na agenda · ${fmtDia(p.ontem)}`,
+         det('ontem')) +
     card('hoje', 'Hoje', N(reu.hoje.agendadas || 0),
-         `agendadas · ${N(reu.hoje.realizadas || 0)} já validadas`, det('hoje')) +
-    card('forte', 'Total do mês', N(rmes.agendadas || 0),
-         `agendadas · ${N(rmes.realizadas || 0)} validadas · conversão ${P(conv.taxa)}
+         `<b>na agenda</b>, concluídas ou não · ${N(reu.hoje.realizadas || 0)} já validadas`,
+         det('hoje')) +
+    card('forte', 'Total do mês', N(rmes.realizadas || 0),
+         `<b>realizadas</b> · de ${N(rmes.agendadas || 0)} na agenda · conversão ${P(conv.taxa)}
           (${N(conv.deals_ganhos || 0)}/${N(conv.deals_com_reuniao || 0)} negócios)`, det('mes')) +
-    card('futuro', 'Futuras', N(rfut.agendadas || 0),
-         `já na agenda depois de hoje · em ${N(rfut.dias || 0)} dia(s)`, det('futuras')));
+    card('futuro', 'Futuras', N(rfut.pendentes || 0),
+         `<b>pendentes</b> depois de hoje · em ${N(rfut.dias || 0)} dia(s)${
+           rfut.realizadas ? ` · ${N(rfut.realizadas)} já marcada(s) como concluída(s)` : ''}`,
+         det('futuras')));
 
   // 2 ── GANHO — duas réguas: EQUIPE (closers da lista) e FUNIL (tudo)
   const eqNomes = (d.equipe && d.equipe.lista || []).join(' + ') || 'closers';
@@ -3839,7 +3902,16 @@ function verReunioes(qual){
             : qual === 'ontem' ? dadosPainel.periodo.ontem : null;
   const dup = (qual === 'hoje' ? r.hoje : qual === 'ontem' ? r.ontem : {})?.duplicadas_ocultas || 0;
   const rot = ROT_REU[qual] || qual;
-  const val = qual === 'mes' ? (r.mes || {}) : qual === 'futuras' ? (r.futuras || {}) : null;
+
+  // o cabeçalho tem que mostrar PRIMEIRO o número que está no card, senão volta a
+  // confusão de comparar réguas diferentes. Conto da própria lista exibida.
+  const nSt = s => itens.filter(i => i.status === s).length;
+  const REGRA_CARD = {
+    ontem:   {n: nSt('realizada'), rot: 'realizadas'},
+    hoje:    {n: itens.length,     rot: 'na agenda'},
+    mes:     {n: nSt('realizada'), rot: 'realizadas'},
+    futuras: {n: nSt('pendente'),  rot: 'pendentes'},
+  }[qual] || {n: itens.length, rot: 'registros'};
 
   const linhas = itens.map(i => `
     <tr>
@@ -3854,9 +3926,8 @@ function verReunioes(qual){
   box.innerHTML = `
     <div class="det-box det">
       <div class="det-head">
-        <span class="t">Reuniões — ${rot} · ${dia ? dia + ' · ' : ''}${itens.length} registro(s)${
-          val ? ` · ${N(val.agendadas || 0)} agendadas${
-            val.realizadas != null ? ` / ${N(val.realizadas)} validadas` : ''}` : ''}</span>
+        <span class="t">Reuniões — ${rot} · ${dia ? dia + ' · ' : ''}${
+          N(REGRA_CARD.n)} ${REGRA_CARD.rot} de ${N(itens.length)} na lista</span>
         <button class="x" onclick="verReunioes('${qual}')">fechar</button>
       </div>
       ${itens.length ? `
@@ -3867,19 +3938,35 @@ function verReunioes(qual){
           qual === 'futuras' ? 'depois de hoje até o fim do mês.' :
           qual === 'mes' ? 'no mês.' : 'nesse dia.'}</div>`}
       <div class="det-nota">
-        <b>Agendada</b> = negócio nos funis Navigator/MGM e quem agendou é do time${
-          (r.time || []).length ? ` (${r.time.map(n => esc(n)).join(', ')})` : ''} — não importa de quem é o negócio.
-        ${r.excluidos ? `Atividade com <b>${esc(r.excluidos)}</b> como responsável não conta: é a cópia que o Pipedrive gera para quem conduz.` : ''}
-        <b>Validada</b> = concluída, dentro do filtro de Reunião Validada e em negócio de <b>${esc(DONO_REU)}</b>, que é quem conduz.
-        <b>Não validada</b> = concluída, mas reprovada em uma dessas duas regras.
+        <b>Esta lista</b> é o universo do card: negócio nos funis Navigator/MGM, agendado
+        por ${esc((r.time || []).join(' ou ') || 'alguém do time')}, em negócio de
+        ${esc((r.donos || []).join(', ') || DONO_REU)}, com a data de vencimento no período.
+        ${r.excluidos ? `Atividade com <b>${esc(r.excluidos)}</b> como responsável não entra: é a cópia que o Pipedrive gera para quem conduz.` : ''}
+        <br><b>O card mostra ${N(REGRA_CARD.n)} (${REGRA_CARD.rot})</b> — ${{
+          ontem:   'no dia anterior a pergunta é o que de fato aconteceu, então vale só a validada.',
+          hoje:    'o dia ainda não acabou, então vale tudo que está marcado, concluído ou não.',
+          mes:     'no fechamento do mês a pergunta é o que de fato aconteceu, então vale só a validada.',
+          futuras: 'reunião que ainda vai acontecer é a que não está concluída.',
+        }[qual] || ''}
+        Os quatro cards usam réguas diferentes de propósito, então
+        <b>eles não somam nem se comparam entre si</b> — o mês pode ser menor que o dia.
+        <br><b>Validada</b> = concluída e dentro do filtro de Reunião Validada.
+        <b>Não validada</b> = concluída, mas fora desse filtro.
         <b>Pendente</b> = ainda não marcada como concluída.
-        Toda validada é também agendada — o primeiro número sempre contém o segundo.
         ${dup > 0 ? `<br><b>${dup}</b> atividade(s) duplicada(s) no mesmo negócio foram ocultadas — no Pipedrive existe mais de uma para o mesmo negócio neste dia.` : ''}
         ${r.fora_escopo > 0 ? `<br><b>${r.fora_escopo}</b> reunião(ões) do mês ficaram de fora por estarem em funil que não é Navigator nem MGM.` : ''}
-        ${r.fora_time > 0 ? `<br><b>${r.fora_time}</b> reunião(ões) do mês ficaram de fora porque quem agendou não está no time${
+        ${r.fora_time > 0 ? `<br><b>${r.fora_time}</b> ficaram de fora porque quem agendou não está no time${
           Object.keys(r.responsaveis_fora || {}).length
             ? ': ' + Object.entries(r.responsaveis_fora).slice(0, 6)
                 .map(([n, q]) => `${esc(n)} (${N(q)})`).join(', ') : ''}.` : ''}
+        ${r.fora_dono > 0 ? `<br><b>${r.fora_dono}</b> ficaram de fora porque o negócio não é de nenhuma closer do time${
+          Object.keys(r.donos_fora || {}).length
+            ? ': ' + Object.entries(r.donos_fora).slice(0, 6)
+                .map(([n, q]) => `${esc(n)} (${N(q)})`).join(', ') : ''}.` : ''}
+        ${r.dono_incerto > 0 ? `<br><b class="falta">${r.dono_incerto}</b> reunião(ões) do mês estão
+          <b>contadas mesmo sem eu saber de quem é o negócio</b> — ele não apareceu entre os ganhos,
+          abertos ou perdidos que eu leio. Preferi contar a sumir com elas em silêncio, mas se esse
+          número for alto vale olhar: ou é negócio de outro funil, ou de mês antigo.` : ''}
       </div>
     </div>`;
 }
@@ -3992,10 +4079,16 @@ function caixaJacare(d){
   const metaHoje = iUlt >= 0 ? Number(j[iUlt].meta_mtd || 0) : 0;
   const metaMes  = Number(d.periodo.meta_mes || 0);
   const gap      = real - metaHoje;
+  const gapBr    = bruto - metaHoje;
   const pctMes   = metaMes  ? (real / metaMes)  * 100 : null;   // atingimento da meta cheia
   const pctMtd   = metaHoje ? (real / metaHoje) * 100 : null;   // atingimento do ritmo (MTD)
-  const cls      = gap >= 0 ? 'gt-pos' : 'gt-neg';
-  const sinal    = gap >= 0 ? '+' : '−';
+  // o mesmo ritmo, medido sem multiplicador: é a venda que de fato entrou no caixa
+  const pctMtdBr = metaHoje ? (bruto / metaHoje) * 100 : null;
+  const pctMesBr = metaMes  ? (bruto / metaMes)  * 100 : null;
+  const cls      = gap   >= 0 ? 'gt-pos' : 'gt-neg';
+  const clsBr    = gapBr >= 0 ? 'gt-pos' : 'gt-neg';
+  const sinal    = gap   >= 0 ? '+' : '−';
+  const sinalBr  = gapBr >= 0 ? '+' : '−';
   return `<div class="graf-total">
       <div class="gt-cols">
         <div class="gt-col">
@@ -4011,12 +4104,19 @@ function caixaJacare(d){
           <div class="gt-val">${R(metaHoje)}</div>
         </div>
         <div class="gt-col">
-          <div class="gt-rot">Ating. MTD</div>
+          <div class="gt-rot">Ating. MTD <span class="gt-pct">c/ multi</span></div>
           <div class="gt-val ${cls}">${P(pctMtd)}</div>
         </div>
+        <div class="gt-col">
+          <div class="gt-rot">Ating. MTD <span class="gt-pct">bruto</span></div>
+          <div class="gt-val ${clsBr}">${P(pctMtdBr)}</div>
+        </div>
       </div>
-      <div class="gt-sub"><span class="${cls}">${sinal}${R(Math.abs(gap))}</span> vs. ritmo de hoje
-        &nbsp;·&nbsp; meta do mês ${R(metaMes)} (<b>${P(pctMes)}</b> atingido)</div>
+      <div class="gt-sub">vs. ritmo de hoje:
+        <span class="${cls}">${sinal}${R(Math.abs(gap))}</span> c/ multi ·
+        <span class="${clsBr}">${sinalBr}${R(Math.abs(gapBr))}</span> bruto
+        &nbsp;·&nbsp; meta do mês ${R(metaMes)} (<b>${P(pctMes)}</b> c/ multi,
+        ${P(pctMesBr)} bruto)</div>
     </div>`;
 }
 
