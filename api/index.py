@@ -1277,7 +1277,10 @@ def contar_reunioes(mes, ano, users, dias, deals_extra=None, pipelines_escopo=No
 
         detalhe[dia].append({
             "deal_id": deal_id,
-            "responsavel": nome_por_uid.get(resp_uid, "—"),
+            "responsavel": nome_por_uid.get(resp_uid, "—"),   # quem AGENDOU (a SDR)
+            # quem CONDUZ: é o dono do negócio. É este que a tela mostra, porque a
+            # pergunta de quem lê é "reunião de quem?", não "quem marcou na agenda".
+            "closer": nome_dono or "— dono não identificado —",
             "hora": hora or None,
             "funil": pipes.get(pid_deal) or None,
             "assunto": a.get("subject") or "(sem assunto)",
@@ -1798,11 +1801,12 @@ def calcular_navigator(mes=None, ano=None):
         ganhos_ref = [d for d in ganhos if eh_referido(d)]
 
         ST_DEAL = {"won": "Ganho", "lost": "Perdido", "open": "Aberto"}
-        itens_ref = []
-        for d in refs:
+        ordem_st = {"Ganho": 0, "Aberto": 1, "Perdido": 2}
+
+        def _item_ref(d):
             po, pt = motivo_referido(d)
             org = cf(d, CF_ORIGEM)
-            itens_ref.append({
+            return {
                 "id": d.get("id"),
                 "titulo": d.get("title") or "(sem título)",
                 "dono": owner_name(d, users) or "— sem dono —",
@@ -1812,10 +1816,18 @@ def calcular_navigator(mes=None, ano=None):
                 "funil": (buscar_pipelines_mapa() or {}).get(d.get("pipeline_id")) or "—",
                 "origem": (org.get("label") if isinstance(org, dict) else org) or "—",
                 "por": ("origem + tag" if (po and pt) else "origem" if po else "tag"),
+                "por_origem": bool(po),
+                "por_tag": bool(pt),
                 "url": f"https://boardacademy.pipedrive.com/deal/{d.get('id')}",
-            })
-        ordem_st = {"Ganho": 0, "Aberto": 1, "Perdido": 2}
-        itens_ref.sort(key=lambda x: (ordem_st.get(x["status"], 9), -x["valor"]))
+            }
+
+        def _ordena_ref(lista):
+            return sorted(lista, key=lambda x: (ordem_st.get(x["status"], 9), -x["valor"]))
+
+        itens_ref = _ordena_ref([_item_ref(d) for d in refs])
+        # o card "Indicados em aberto" conta o pipe de QUALQUER mês, então a lista
+        # dele não pode sair de `refs` (que é só quem entrou neste mês).
+        itens_ref_abertos = _ordena_ref([_item_ref(d) for d in abertos_ref])
         referidos = {
             "no_mes": len(refs),
             "criados_no_mes": len(criados),
@@ -1827,6 +1839,7 @@ def calcular_navigator(mes=None, ano=None):
             "ganhos_no_mes": len(ganhos_ref),
             "regra": {"origem": ORIGEM_REFERIDO, "tag": TAG_REFERIDO_VALOR},
             "itens": itens_ref,
+            "itens_abertos": itens_ref_abertos,
         }
     except Exception as e:
         erro_ref = f"{type(e).__name__}: {e}"
@@ -3344,18 +3357,20 @@ function render(d){
 
   // 7 ── REFERIDOS (só volume: quantas pessoas foram indicadas)
   const rf = d.referidos;
+  const detR = q => `<button class="btn-det" onclick="verRef('${q}')">Detalhamento</button>`;
   const bReferidos = !rf ? '' : bloco('Referidos',
     `Origem contém "${esc(rf.regra.origem)}" ou tag "${esc(rf.regra.tag)}"`,
     card('forte', 'Indicados no mês', N(rf.no_mes),
          `de ${N(rf.criados_no_mes)} negócio(s) criados no mês${
-           rf.pct_do_mes == null ? '' : ` · ${P(rf.pct_do_mes)} da entrada`}`,
-         (rf.itens || []).length ? `<button class="btn-det" onclick="verReferidos()">Ver lista</button>` : '') +
+           rf.pct_do_mes == null ? '' : ` · ${P(rf.pct_do_mes)} da entrada`}`, detR('mes')) +
     card('', 'Por Origem', N(rf.por_origem),
-         `campo Origem com "${esc(rf.regra.origem)}"`) +
+         `campo Origem com "${esc(rf.regra.origem)}"`, detR('origem')) +
     card('', 'Por tag', N(rf.por_tag),
-         `tag "${esc(rf.regra.tag)}"${rf.por_ambos ? ` · ${N(rf.por_ambos)} batem as duas` : ''}`) +
+         `tag "${esc(rf.regra.tag)}"${rf.por_ambos ? ` · ${N(rf.por_ambos)} batem as duas` : ''}`,
+         detR('tag')) +
     card('futuro', 'Indicados em aberto', N(rf.em_aberto),
-         `no pipe agora, de qualquer mês · ${N(rf.ganhos_no_mes)} ganho(s) no mês`));
+         `no pipe agora, de qualquer mês · ${N(rf.ganhos_no_mes)} ganho(s) no mês`,
+         detR('aberto')));
 
   const notaComp = d.consolidado ? `
     <div class="nota-comp">Consolidado: <b>Navigator</b> ${N(cFunis.navigator?.qtd || 0)} venda(s) ·
@@ -3917,7 +3932,7 @@ function verReunioes(qual){
     <tr>
       ${multiDia ? `<td class="hora">${fmtDia(i.dia)}</td>` : ''}
       <td class="hora">${i.hora || '—'}</td>
-      <td>${esc(i.responsavel)}</td>
+      <td>${esc(i.closer || i.responsavel)}</td>
       <td>${i.funil ? esc(i.funil) : '<span class="zero">—</span>'}</td>
       <td>${i.deal_url ? `<a href="${i.deal_url}" target="_blank" rel="noopener">${esc(i.deal || i.assunto)} ↗</a>` : esc(i.assunto)}</td>
       <td><span class="st st-${i.status}">${ST_LABEL[i.status]}</span></td>
@@ -3932,7 +3947,7 @@ function verReunioes(qual){
       </div>
       ${itens.length ? `
         <table>
-          <thead><tr>${multiDia ? '<th>Dia</th>' : ''}<th>Hora</th><th>Responsável</th><th>Funil</th><th>Negócio</th><th>Status</th></tr></thead>
+          <thead><tr>${multiDia ? '<th>Dia</th>' : ''}<th>Hora</th><th>Closer</th><th>Funil</th><th>Negócio</th><th>Status</th></tr></thead>
           <tbody>${linhas}</tbody>
         </table>` : `<div class="det-vazio">Nenhuma reunião registrada ${
           qual === 'futuras' ? 'depois de hoje até o fim do mês.' :
@@ -3971,50 +3986,85 @@ function verReunioes(qual){
     </div>`;
 }
 
-// ── LISTA DE INDICAÇÕES ───────────────────────────────────────
-function verReferidos(){
-  const box = document.getElementById('det-referidos');
-  if (!box || !dadosPainel || !dadosPainel.referidos) return;
-  if (box.dataset.aberto === '1') { box.innerHTML = ''; box.dataset.aberto = ''; return; }
-  box.dataset.aberto = '1';
+// ── REFERIDOS: os 4 cards ─────────────────────────────────────
+const ST_REF = {Ganho: 'realizada', Aberto: 'pendente', Perdido: 'nao_validada'};
 
-  const rf = dadosPainel.referidos;
-  const itens = rf.itens || [];
-  const ST = {Ganho:'realizada', Aberto:'pendente', Perdido:'nao_validada'};
-
-  const linhas = itens.map(i => `
+function tabelaRef(itens, vazio){
+  if (!itens || !itens.length) return `<div class="det-vazio">${vazio}</div>`;
+  let v = 0;
+  const linhas = itens.map(i => {
+    v += (i.valor || 0);
+    return `
     <tr>
       <td class="hora">${fmtDia(i.criado)}</td>
       <td><a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)} ↗</a></td>
       <td>${esc(i.dono)}</td>
       <td>${esc(i.funil)}</td>
       <td>${esc(i.origem)}</td>
-      <td><span class="fr fr-${i.por === 'tag' ? 'renovacao' : 'mgm'}">${esc(i.por)}</span></td>
+      <td><span class="fr fr-${i.por === 'tag' ? 'renovacao' : i.por === 'origem' ? 'mgm' : 'navigator'}">${esc(i.por)}</span></td>
       <td class="num">${i.valor ? R(i.valor) : '<span class="zero">—</span>'}</td>
-      <td><span class="st st-${ST[i.status] || 'pendente'}">${esc(i.status)}</span></td>
-    </tr>`).join('');
-
-  box.innerHTML = `
-    <div class="det-box det">
-      <div class="det-head">
-        <span class="t">Indicações do mês · ${itens.length} negócio(s)</span>
-        <button class="x" onclick="verReferidos()">fechar</button>
-      </div>
-      ${itens.length ? `
-        <table>
-          <thead><tr>
-            <th>Criado</th><th>Negócio</th><th>Dono</th><th>Funil</th>
-            <th>Origem</th><th>Entrou por</th><th class="num">Valor</th><th>Status</th>
-          </tr></thead>
-          <tbody>${linhas}</tbody>
-        </table>` : '<div class="det-vazio">Nenhuma indicação registrada no mês.</div>'}
-      <div class="det-nota">
-        Entra quem tem Origem contendo <b>${esc(rf.regra.origem)}</b> ou a tag
-        <b>${esc(rf.regra.tag)}</b>. A data é a de criação do negócio, então a lista é
-        de quem <b>entrou</b> no mês — inclusive os já perdidos.
-      </div>
-    </div>`;
+      <td><span class="st st-${ST_REF[i.status] || 'pendente'}">${esc(i.status)}</span></td>
+    </tr>`;
+  }).join('');
+  return `
+    <table>
+      <thead><tr>
+        <th>Criado</th><th>Negócio</th><th>Dono</th><th>Funil</th>
+        <th>Origem</th><th>Entrou por</th><th class="num">Valor</th><th>Status</th>
+      </tr></thead>
+      <tbody>${linhas}
+        <tr class="total"><td colspan="6">${N(itens.length)} indicação(ões)</td>
+          <td class="num">${R(v)}</td><td></td></tr></tbody>
+    </table>`;
 }
+
+function verRef(qual){
+  if (!dadosPainel || !dadosPainel.referidos) return;
+  const rf = dadosPainel.referidos;
+  const doMes = rf.itens || [];
+
+  const cfg = {
+    mes: {
+      itens: doMes,
+      tit: `Indicados no mês · ${N(rf.no_mes)} de ${N(rf.criados_no_mes)} negócio(s) criados`,
+      vazio: 'Nenhuma indicação entrou no mês.',
+      nota: `A data é a de <b>criação</b> do negócio, então esta é a lista de quem
+             <b>entrou</b> no mês — inclusive os que já foram perdidos depois.`,
+    },
+    origem: {
+      itens: doMes.filter(i => i.por_origem),
+      tit: `Indicados por Origem · ${N(rf.por_origem)} no mês`,
+      vazio: 'Nenhuma indicação entrou pelo campo Origem neste mês.',
+      nota: `Só os que têm <b>"${esc(rf.regra.origem)}"</b> no campo Origem.
+             ${rf.por_ambos ? `<b>${N(rf.por_ambos)}</b> deles também têm a tag, então aparecem
+             nas duas listas — por isso Origem + tag não soma o total.` : ''}`,
+    },
+    tag: {
+      itens: doMes.filter(i => i.por_tag),
+      tit: `Indicados por tag · ${N(rf.por_tag)} no mês`,
+      vazio: 'Nenhuma indicação entrou pela tag neste mês.',
+      nota: `Só os que têm a tag <b>"${esc(rf.regra.tag)}"</b>.
+             ${rf.por_ambos ? `<b>${N(rf.por_ambos)}</b> deles também têm a Origem preenchida, então
+             aparecem nas duas listas — por isso Origem + tag não soma o total.` : ''}`,
+    },
+    aberto: {
+      itens: rf.itens_abertos || [],
+      tit: `Indicados em aberto · ${N(rf.em_aberto)} no pipe`,
+      vazio: 'Nenhuma indicação em aberto no pipe.',
+      nota: `Esta é a única das quatro listas que <b>não é do mês</b>: é o pipe aberto de
+             qualquer época. Por isso ela pode ser maior ou menor que a dos indicados do mês,
+             e os dois números não se somam.`,
+    },
+  }[qual];
+  if (!cfg) return;
+
+  abreDet('det-referidos', qual, cfg.tit, tabelaRef(cfg.itens, cfg.vazio),
+    `Entra quem tem Origem contendo <b>${esc(rf.regra.origem)}</b> ou a tag
+     <b>${esc(rf.regra.tag)}</b>. ${cfg.nota}`);
+}
+
+// compat: botão antigo "Ver lista"
+function verReferidos(){ verRef('mes'); }
 
 // ── GRÁFICOS ──────────────────────────────────────────────────
 const COR_FRENTE = { navigator: '#1A1A2E', mgm: '#B8860B', renovacao: '#7A8CA8' };
