@@ -97,7 +97,9 @@ DONO_REUNIAO = os.environ.get("DONO_REUNIAO", "Denise Mussolin")
 
 # Quem pode AGENDAR para a reunião contar. Vazio = CLOSERS + SDRS.
 # É o time de Ascensão: a régua de "agendada" é funil + responsável do time.
-TIME_REUNIAO = os.environ.get("TIME_REUNIAO", "")
+# ATENÇÃO: deixar vazio faz a lista virar CLOSERS + SDRS, e aí toda closer nova
+# vira "quem agenda" sem ninguém pedir. Por isso aqui é explícito.
+TIME_REUNIAO = os.environ.get("TIME_REUNIAO", "Raphaela Moutinho,Mylena Oliveira")
 # Rede de segurança: reunião em negócio do DONO_REUNIAO conta mesmo que quem
 # agendou esteja fora da lista — impede que a régua nova derrube número antigo.
 REU_SEMPRE_DONO = os.environ.get("REU_SEMPRE_DONO", "1") not in ("0", "false", "")
@@ -1517,6 +1519,87 @@ def calcular_navigator(mes=None, ano=None):
     dias_futuros = [d for d in todos_dias_mes if d >= hoje_str]
     b_futuro = bucket_dias(abertos, dias_futuros)
 
+    # ── Listas por trás de cada card (botão "Detalhamento") ───
+    # Todo número grande do Painel do Mês passa a ter a lista que o gerou. Sem isso
+    # o painel é um oráculo: diz "R$ 83.400" e ninguém sabe de quais negócios.
+    frente_de = {}
+    for d in ganhos_nav + abertos_nav:
+        frente_de[d.get("id")] = "renovacao" if eh_renovacao(d) else "navigator"
+    for d in ganhos_mgm + abertos_mgm:
+        frente_de[d.get("id")] = "mgm"
+
+    def _item_ganho(d):
+        v = float(d.get("value") or 0)
+        mv = float(cf(d, CF_MULTIPLICADOR) or 0)
+        did = d.get("id")
+        return {
+            "id": did,
+            "titulo": d.get("title") or "(sem título)",
+            "dono": owner_name(d, users) or "— sem dono —",
+            "dia": won_time_br(d)[:10] or None,
+            "bruto": arred(v),
+            "multi": arred(mv),
+            "fator": arred(safe_div(mv, v)) if v else None,
+            "frente": frente_de.get(did) or "navigator",
+            "produto": produto_do_deal(d),
+            "url": f"https://boardacademy.pipedrive.com/deal/{did}",
+        }
+
+    itens_ganhos = sorted((_item_ganho(d) for d in ganhos),
+                          key=lambda x: (x["dia"] or "", -x["multi"]))
+
+    PESO_PV = {20: 0.20, 50: 0.50, 70: 0.70}
+
+    def _item_aberto(d):
+        v = float(d.get("value") or 0)
+        pr = d.get("probability")
+        did = d.get("id")
+        return {
+            "id": did,
+            "titulo": d.get("title") or "(sem título)",
+            "dono": owner_name(d, users) or "— sem dono —",
+            "valor": arred(v),
+            "probabilidade": pr,
+            "ponderado": arred(v * PESO_PV.get(pr, 0.0)),
+            "frente": frente_de.get(did) or "navigator",
+            "prev": str(d.get("expected_close_date") or "")[:10] or None,
+            "url": f"https://boardacademy.pipedrive.com/deal/{did}",
+        }
+
+    set_futuros = set(dias_futuros)
+    itens_futuro = sorted(
+        (_item_aberto(d) for d in abertos
+         if str(d.get("expected_close_date") or "")[:10] in set_futuros),
+        key=lambda x: (x["prev"] or "9999-99-99", -x["ponderado"]))
+    b_futuro = dict(b_futuro, itens=itens_futuro)
+    b_hoje = dict(b_hoje, itens=[i for i in itens_futuro if i["prev"] == hoje_str])
+
+    # Curva MTD: dia a dia, o que a meta pedia acumulado x o que entrou acumulado.
+    # É o detalhamento do card "MTD — deveria estar": mostra ONDE o atraso nasceu.
+    curva_mtd, acum_meta, acum_multi, acum_bruto, du_i = [], 0.0, 0.0, 0.0, 0
+    for dia in todos_dias_mes:
+        dt_dia = date(ano, mes, int(dia[8:10]))
+        e_du = dt_dia.weekday() < 5 and dt_dia not in feriados
+        if e_du:
+            du_i += 1
+            # du_total pode vir da planilha METAS e não bater com o calendário.
+            # Travar em du_total faz a curva fechar EXATAMENTE em meta_mes e o dia de
+            # hoje cair exatamente em deveria_mtd — a mesma régua do card.
+            acum_meta = meta_dia * min(du_i, du_total)
+        g = por_dia.get(dia) or {}
+        acum_multi += g.get("multi", 0.0)
+        acum_bruto += g.get("bruto", 0.0)
+        curva_mtd.append({
+            "dia": dia, "e_du": e_du, "du": du_i,
+            "meta_acum": arred(acum_meta),
+            "real_acum": arred(acum_multi),
+            "bruto_acum": arred(acum_bruto),
+            "desvio": arred(acum_multi - acum_meta),
+            "entrou": arred(g.get("multi", 0.0)),
+            "qtd": g.get("qtd", 0),
+            "passado": dia <= hoje_str,
+        })
+
     # ── Quebra por closer (dono do deal) ──────────────────────
     por_closer = {}
     for d in ganhos:
@@ -1641,6 +1724,11 @@ def calcular_navigator(mes=None, ano=None):
         "agendadas": sum((cont_reu.get(d) or {}).get("agendadas", 0) for d in dias_depois),
         "dias": sum(1 for d in dias_depois if (cont_reu.get(d) or {}).get("agendadas", 0)),
     }
+    # listas por trás dos cards "Total do mês" e "Futuras" (o dia entra no item,
+    # porque aqui a lista cruza vários dias e sem ele não dá para ler)
+    det_reu = reunioes.get("detalhe") or {}
+    lista_reu_mes = [dict(it, dia=d) for d in dias_mes for it in (det_reu.get(d) or [])]
+    lista_reu_fut = [dict(it, dia=d) for d in dias_depois for it in (det_reu.get(d) or [])]
 
     # ── Referidos: só volume, é a pergunta "quantos indicados tivemos" ──
     referidos, erro_ref = None, None
@@ -1777,6 +1865,8 @@ def calcular_navigator(mes=None, ano=None):
                 "deals_com_reuniao": 0, "deals_ganhos": 0, "taxa": None},
             "lista_hoje":  (reunioes.get("detalhe") or {}).get(hoje_str, []),
             "lista_ontem": (reunioes.get("detalhe") or {}).get(ontem_str, []),
+            "lista_mes":     lista_reu_mes,
+            "lista_futuras": lista_reu_fut,
             "excluidos": EXCLUIR_REU,
             "dono": DONO_REUNIAO,
             "fora_escopo": (reunioes.get("fora_escopo") or 0),
@@ -1806,6 +1896,8 @@ def calcular_navigator(mes=None, ano=None):
         "detalhe_hoje": b_hoje,
         "detalhe_ontem": b_ontem,
         "detalhe_futuro": b_futuro,          # forecast de hoje em diante
+        "ganhos_itens": itens_ganhos,        # lista por trás de todo card de Ganho
+        "curva_mtd": curva_mtd,              # detalhamento do MTD, dia a dia
         "frentes": resumo_frentes,           # as 3 frentes, embutidas aqui
         "referidos": referidos,
         "etapas_previsao": nomes_etapas_previsao(),
@@ -2762,7 +2854,11 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:22px}
   .kcard{background:var(--white);border:1px solid var(--border);border-left:3px solid var(--gold);
          border-radius:8px;padding:14px 16px;box-shadow:var(--shadow)}
-  .kcard .rot{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+  /* o rótulo e o botão "Detalhamento" dividem a linha de cima. Com float o botão
+     invadia o número nos rótulos longos ("Realizado c/ multiplicador"); flex resolve. */
+  .kcard .rot{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;
+              display:flex;align-items:flex-start;justify-content:space-between;gap:8px;min-height:15px}
+  .kcard .rot .btn-det{float:none;flex:0 0 auto;margin-top:-2px}
   .kcard .val{font-size:22px;font-weight:700;color:var(--navy);margin-top:6px;font-variant-numeric:tabular-nums}
   .kcard .sub{font-size:11px;color:var(--muted);margin-top:3px}
   .kcard.hoje{border-left-color:#1E3A8A;background:var(--blue-bg)}
@@ -2816,6 +2912,17 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .st-motivo{font-size:10px;color:var(--muted);margin-top:3px;line-height:1.3}
   .det-vazio{padding:22px;text-align:center;color:var(--muted);font-size:12px}
   .det-nota{padding:10px 16px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);line-height:1.6}
+  .det-nota b{color:var(--navy)}
+  .det th.num,.det td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .det tr.total td{background:var(--gold-bg);border-top:2px solid var(--gold);font-weight:700;color:var(--navy)}
+  .det tr.total td:first-child{color:var(--gold);font-size:10px;letter-spacing:.5px;text-transform:uppercase}
+  .det .gt-eq{color:var(--amber);font-weight:700;font-size:10px}
+  .det .obs{font-size:11px;color:var(--muted)}
+  .det table.conta td:first-child{color:var(--navy);font-weight:600}
+  .det table.conta tr:last-child td{border-bottom:none}
+  .det tr.mtd-hoje td{background:var(--blue-bg)}
+  .det tr.mtd-futuro td{color:var(--muted)}
+  .det tr.mtd-futuro .hora{color:var(--muted);font-weight:600}
 
   .nota-comp{font-size:11px;color:var(--muted);padding:9px 4px 0;line-height:1.6}
   .nota-comp b{color:var(--navy)}
@@ -3068,20 +3175,25 @@ function render(d){
       <div class="sub">${sub}</div>
     </div>`;
 
-  const det = q => `<button class="btn-det" onclick="verReunioes('${q}')">Detalhamento</button>`;
+  // botão Detalhamento — um por card, cada bloco com a sua função e o seu painel
+  const det  = q => `<button class="btn-det" onclick="verReunioes('${q}')">Detalhamento</button>`;
+  const detG = q => `<button class="btn-det" onclick="verGanho('${q}')">Detalhamento</button>`;
+  const detF = q => `<button class="btn-det" onclick="verFc('${q}')">Detalhamento</button>`;
+  const detV = q => `<button class="btn-det" onclick="verVisao('${q}')">Detalhamento</button>`;
 
   // 1 ── REUNIÕES
   const bReunioes = bloco('Reuniões',
     `agendada = funil Navigator/MGM + quem agendou é do time · validada = conduzida por ${esc(reu.dono || DONO_REU)}`,
-    card('ontem', 'Último dia útil', N(reu.ontem.realizadas || 0),
-         `validadas de ${N(reu.ontem.agendadas || 0)} agendadas · ${fmtDia(p.ontem)}`, det('ontem')) +
+    // número grande = AGENDADAS nos quatro, senão o mês fica menor que o dia
+    card('ontem', 'Último dia útil', N(reu.ontem.agendadas || 0),
+         `agendadas · ${N(reu.ontem.realizadas || 0)} validadas · ${fmtDia(p.ontem)}`, det('ontem')) +
     card('hoje', 'Hoje', N(reu.hoje.agendadas || 0),
          `agendadas · ${N(reu.hoje.realizadas || 0)} já validadas`, det('hoje')) +
-    card('forte', 'Total do mês', N(rmes.realizadas || 0),
-         `validadas de ${N(rmes.agendadas || 0)} agendadas · conversão ${P(conv.taxa)}
-          (${N(conv.deals_ganhos || 0)}/${N(conv.deals_com_reuniao || 0)} negócios)`) +
+    card('forte', 'Total do mês', N(rmes.agendadas || 0),
+         `agendadas · ${N(rmes.realizadas || 0)} validadas · conversão ${P(conv.taxa)}
+          (${N(conv.deals_ganhos || 0)}/${N(conv.deals_com_reuniao || 0)} negócios)`, det('mes')) +
     card('futuro', 'Futuras', N(rfut.agendadas || 0),
-         `já na agenda depois de hoje · em ${N(rfut.dias || 0)} dia(s)`));
+         `já na agenda depois de hoje · em ${N(rfut.dias || 0)} dia(s)`, det('futuras')));
 
   // 2 ── GANHO — duas réguas: EQUIPE (closers da lista) e FUNIL (tudo)
   const eqNomes = (d.equipe && d.equipe.lista || []).join(' + ') || 'closers';
@@ -3090,25 +3202,28 @@ function render(d){
     `todo o funil (Navigator + MGM, qualquer dono) · "equipe" = recorte de ${esc(eqNomes)}`,
     card('ontem', 'Último dia útil', R(m.entrou_ontem_multi),
          `bruto ${R(m.entrou_ontem_bruto)} · ${fmtDia(p.ontem)}` +
-         soEq(m.entrou_ontem_multi_equipe !== m.entrou_ontem_multi ? R(m.entrou_ontem_multi_equipe) : '')) +
+         soEq(m.entrou_ontem_multi_equipe !== m.entrou_ontem_multi ? R(m.entrou_ontem_multi_equipe) : ''),
+         detG('ontem')) +
     card('hoje', 'Hoje', R(m.entrou_hoje_multi),
          `bruto ${R(m.entrou_hoje_bruto)}` +
-         soEq(m.entrou_hoje_multi_equipe !== m.entrou_hoje_multi ? R(m.entrou_hoje_multi_equipe) : '')) +
+         soEq(m.entrou_hoje_multi_equipe !== m.entrou_hoje_multi ? R(m.entrou_hoje_multi_equipe) : ''),
+         detG('hoje')) +
     card('forte', 'Total do mês', R(m.real_multi),
          `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${R(m.ticket_medio)}` +
          soEq(m.real_multi_equipe !== m.real_multi
-              ? `${R(m.real_multi_equipe)} · ${N(m.qtd_ganhos_mes_equipe)} venda(s)` : '')) +
+              ? `${R(m.real_multi_equipe)} · ${N(m.qtd_ganhos_mes_equipe)} venda(s)` : ''),
+         detG('mes')) +
     card('futuro', 'Previsto futuro', R(df.previsto || 0),
-         `ponderado do pipe de hoje em diante`));
+         `ponderado do pipe de hoje em diante`, detG('futuro')));
 
   // 3 ── FORECAST
   const bForecast = bloco('Forecast', 'negócios em aberto com fechamento de hoje em diante',
-    card('futuro', 'Pipe 20%', R(df.p20 || 0), `pondera ${R((df.p20 || 0) * 0.2)}`) +
-    card('futuro', 'Pipe 50%', R(df.p50 || 0), `pondera ${R((df.p50 || 0) * 0.5)}`) +
-    card('futuro', 'Pipe 70%', R(df.p70 || 0), `pondera ${R((df.p70 || 0) * 0.7)}`) +
+    card('futuro', 'Pipe 20%', R(df.p20 || 0), `pondera ${R((df.p20 || 0) * 0.2)}`, detF('p20')) +
+    card('futuro', 'Pipe 50%', R(df.p50 || 0), `pondera ${R((df.p50 || 0) * 0.5)}`, detF('p50')) +
+    card('futuro', 'Pipe 70%', R(df.p70 || 0), `pondera ${R((df.p70 || 0) * 0.7)}`, detF('p70')) +
     card('forte', 'Total ponderado', R(df.previsto || 0),
          `de ${R(df.em_aberto || 0)} em aberto (${N(df.qtd || 0)} negócios)${
-           cFunis.etapa_previsao ? ' · só em Negociação' : ''}`));
+           cFunis.etapa_previsao ? ' · só em Negociação' : ''}`, detF('total')));
 
   // 4 ── VISÃO MÊS: onde estamos
   const bVisao1 = bloco('Visão mês', `${N(p.du_passados)} de ${N(p.du_total)} dias úteis`,
@@ -3117,27 +3232,29 @@ function render(d){
            ? `${R(m.gap_100)} que faltam ÷ ${N(m.du_com_hoje)} DU restantes${
                m.hoje_e_du ? ' (contando hoje)' : ''}<br>` +
              `<span class="gt-eq">meta linear era ${R(m.meta_dia)}</span>`
-           : 'mês encerrado') +
+           : 'mês encerrado', detV('meta_dia')) +
     card('', 'Realizado', R(m.real_bruto), 'bruto, sem multiplicador' +
-         soEq(m.real_bruto_equipe !== m.real_bruto ? R(m.real_bruto_equipe) : '')) +
+         soEq(m.real_bruto_equipe !== m.real_bruto ? R(m.real_bruto_equipe) : ''),
+         detV('realizado')) +
     card('forte', 'Realizado c/ multiplicador', R(m.real_multi),
          'é este que bate contra a meta' +
-         soEq(m.real_multi_equipe !== m.real_multi ? R(m.real_multi_equipe) : '')) +
+         soEq(m.real_multi_equipe !== m.real_multi ? R(m.real_multi_equipe) : ''),
+         detV('realizado_multi')) +
     card('', 'MTD — deveria estar', R(m.deveria_mtd),
-         `${P(m.pct_mes_decorrido)} do mês decorrido`));
+         `${P(m.pct_mes_decorrido)} do mês decorrido`, detV('mtd')));
 
   // 5 ── VISÃO MÊS: como estamos
   const temRecorte = m.real_multi_equipe !== m.real_multi;
   const gapClsEq = m.gap_100_equipe > 0 ? 'neg' : 'pos';
   const bVisao2 = bloco('Visão mês', `atingimento e o que falta · meta ${R(m.meta_mes)}`, `
     <div class="kcard forte">
-      <div class="rot">Atingimento</div>
+      <div class="rot">Atingimento${detV('atingimento')}</div>
       <div class="val ${m.atingimento >= 100 ? 'pos' : ''}">${P(m.atingimento)}</div>
       <div class="sub">c/ multiplicador · bruto ${P(m.atingimento_bruto)}${
         temRecorte ? `<br><span class="gt-eq">equipe: ${P(m.atingimento_equipe)}</span>` : ''}</div>
     </div>
     <div class="kcard forte">
-      <div class="rot">Gap 100%</div>
+      <div class="rot">Gap 100%${detV('gap')}</div>
       <div class="val ${gapCls}">${R(m.gap_100)}</div>
       <div class="sub">${m.du_com_hoje > 0
         ? `${R(m.meta_dia_ajust)}/dia nos ${N(m.du_com_hoje)} DU restantes`
@@ -3185,8 +3302,14 @@ function render(d){
         nas etapas <b>${esc((d.etapas_previsao || []).join(' · ') || cFunis.etapa_previsao)}</b>,
         de ${N(cFunis.abertos_total || 0)} abertos no total.` : ''}</div>` : '';
 
+  // cada bloco tem o seu painel de detalhamento logo abaixo — abrir um não fecha
+  // o do bloco vizinho, mas abrir outro card do MESMO bloco troca o conteúdo
   const blocos = bReunioes + `<div id="det-reunioes"></div>` +
-                 bGanho + bForecast + bVisao1 + bVisao2 + bSemana +
+                 bGanho    + `<div id="det-ganho"></div>` +
+                 bForecast + `<div id="det-fc"></div>` +
+                 bVisao1   + `<div id="det-visao"></div>` +
+                 bVisao2   + `<div id="det-visao2"></div>` +
+                 bSemana +
                  bReferidos + `<div id="det-referidos"></div>` + notaComp;
 
   // ── POR FRENTE (veio da antiga aba "Resumo — 3 Frentes") ──
@@ -3424,6 +3547,280 @@ let dadosPainel = null;
 const ST_LABEL = {realizada:'Validada', nao_validada:'Não validada', pendente:'Pendente'};
 
 let DONO_REU = 'Denise Mussolin';
+
+// ── motor dos painéis de detalhamento ─────────────────────────
+// Um painel por bloco. Clicar no mesmo card fecha; clicar em outro card do
+// mesmo bloco troca o conteúdo. Toda caixa sai pela mesma porta, então o
+// cabeçalho e o botão "fechar" se comportam igual nos 18 cards.
+function fechaDet(boxId){
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  box.innerHTML = '';
+  box.dataset.aberto = '';
+}
+
+function abreDet(boxId, chave, titulo, corpo, nota){
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  if (box.dataset.aberto === chave) { fechaDet(boxId); return; }
+  box.dataset.aberto = chave;
+  box.innerHTML = `
+    <div class="det-box det">
+      <div class="det-head">
+        <span class="t">${titulo}</span>
+        <button class="x" onclick="fechaDet('${boxId}')">fechar</button>
+      </div>
+      ${corpo}
+      ${nota ? `<div class="det-nota">${nota}</div>` : ''}
+    </div>`;
+  if (box.scrollIntoView) { try { box.scrollIntoView({behavior:'smooth', block:'nearest'}); } catch(e){} }
+}
+
+const FR_NOME = { navigator: 'Ascensão', mgm: 'MGM', renovacao: 'Renovação' };
+const tagFr = f => `<span class="fr fr-${f || 'navigator'}">${esc(FR_NOME[f] || f || '—')}</span>`;
+const sinalR = v => v >= 0 ? `<span class="pos">+${R(v)}</span>`
+                           : `<span class="neg">−${R(Math.abs(v))}</span>`;
+
+// tabela de VENDAS (dia, negócio, dono, frente, produto, bruto, multiplicador)
+function tabelaGanhos(itens, vazio){
+  if (!itens || !itens.length) return `<div class="det-vazio">${vazio}</div>`;
+  let b = 0, m = 0;
+  const linhas = itens.map(i => {
+    b += (i.bruto || 0); m += (i.multi || 0);
+    const temFator = i.fator != null && Math.abs(i.fator - 1) > 0.01;
+    return `
+    <tr>
+      <td class="hora">${i.dia ? fmtDia(i.dia) : '—'}</td>
+      <td><a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)} ↗</a></td>
+      <td>${esc(i.dono)}</td>
+      <td>${tagFr(i.frente)}</td>
+      <td>${esc(i.produto)}</td>
+      <td class="num">${R(i.bruto)}</td>
+      <td class="num"><b>${R(i.multi)}</b>${
+        temFator ? ` <span class="gt-eq">${i.fator.toFixed(2).replace('.',',')}x</span>` : ''}</td>
+    </tr>`;
+  }).join('');
+  return `
+    <table>
+      <thead><tr>
+        <th>Dia</th><th>Negócio</th><th>Dono</th><th>Frente</th><th>Produto</th>
+        <th class="num">Bruto</th><th class="num">c/ Multiplicador</th>
+      </tr></thead>
+      <tbody>${linhas}
+        <tr class="total">
+          <td colspan="5">${N(itens.length)} venda(s)</td>
+          <td class="num">${R(b)}</td><td class="num">${R(m)}</td>
+        </tr></tbody>
+    </table>`;
+}
+
+// ── GANHO: os 4 cards ─────────────────────────────────────────
+function verGanho(qual){
+  if (!dadosPainel) return;
+  const p = dadosPainel.periodo, m = dadosPainel.metricas;
+  const eq = ((dadosPainel.equipe || {}).lista || []).join(' + ') || 'os closers da lista';
+
+  if (qual === 'futuro') {
+    const it = (dadosPainel.detalhe_futuro || {}).itens || [];
+    abreDet('det-ganho', qual,
+      `Previsto futuro · ${R((dadosPainel.detalhe_futuro || {}).previsto || 0)} ponderado · ${N(it.length)} negócio(s)`,
+      listaNegocios(it, 'Nenhum negócio em aberto com fechamento de hoje até o fim do mês.'),
+      `Aqui <b>não tem venda</b>: são negócios ABERTOS com data prevista de hoje até o fim do
+       mês, ponderados por 20/50/70. É promessa de pipe, não dinheiro. Clique no cabeçalho
+       de qualquer coluna para ordenar.`);
+    return;
+  }
+
+  const g = dadosPainel.ganhos_itens || [];
+  const filtro = qual === 'hoje'  ? (i => i.dia === p.hoje)
+               : qual === 'ontem' ? (i => i.dia === p.ontem)
+               : (() => true);
+  const rot = qual === 'hoje'  ? `Hoje · ${fmtDia(p.hoje)}`
+            : qual === 'ontem' ? `Último dia útil · ${fmtDia(p.ontem)}`
+            : `Total do mês · ticket médio ${R(m.ticket_medio)}`;
+  const itens = g.filter(filtro);
+  abreDet('det-ganho', qual, `Ganho — ${rot} · ${N(itens.length)} venda(s)`,
+    tabelaGanhos(itens, 'Nenhuma venda fechada nesse período.'),
+    `Entra <b>toda</b> venda dos funis Navigator + MGM, de qualquer dono — é a régua dos
+     cards. O recorte "equipe" que aparece pequeno no card é só ${esc(eq)}.
+     <b>c/ Multiplicador</b> é o campo do Pipedrive e é ele que bate contra a meta;
+     o <b>x</b> ao lado aparece só quando o multiplicador é diferente de 1.`);
+}
+
+// ── FORECAST: os 4 cards ──────────────────────────────────────
+function verFc(qual){
+  if (!dadosPainel) return;
+  const df = dadosPainel.detalhe_futuro || {};
+  const it = df.itens || [];
+  const PR = {p20: 20, p50: 50, p70: 70};
+  const itens = qual === 'total' ? it : it.filter(i => i.probabilidade === PR[qual]);
+  let soma = 0, pond = 0;
+  itens.forEach(i => { soma += (i.valor || 0); pond += (i.ponderado || 0); });
+  const rot = qual === 'total' ? 'Total ponderado' : `Pipe ${PR[qual]}%`;
+  const semProb = qual === 'total' ? itens.filter(i => i.probabilidade == null).length : 0;
+
+  abreDet('det-fc', qual,
+    `Forecast — ${rot} · ${N(itens.length)} negócio(s) · ${R(soma)} em aberto · ${R(pond)} ponderado`,
+    listaNegocios(itens, 'Nenhum negócio em aberto nesta faixa.'),
+    `Negócios ABERTOS com fechamento previsto de hoje até o fim do mês${
+      (dadosPainel.composicao || {}).etapa_previsao
+        ? `, só nas etapas <b>${esc((dadosPainel.etapas_previsao || []).join(' · '))}</b>` : ''}.
+     ${qual === 'total'
+        ? `O ponderado soma 20% × ${R(df.p20 || 0)} + 50% × ${R(df.p50 || 0)} + 70% × ${R(df.p70 || 0)}.${
+            semProb ? ` <b>${N(semProb)}</b> negócio(s) estão sem probabilidade preenchida e por isso
+                        pesam zero no ponderado, mesmo aparecendo na lista.` : ''}`
+        : `Cada um pesa ${PR[qual]}% do valor no ponderado.`}
+     Clique no cabeçalho de qualquer coluna para ordenar.`);
+}
+
+// ── VISÃO MÊS: os 4 cards + atingimento e gap ─────────────────
+const BOX_VISAO = {meta_dia:'det-visao', realizado:'det-visao', realizado_multi:'det-visao',
+                   mtd:'det-visao', atingimento:'det-visao2', gap:'det-visao2'};
+
+function verVisao(qual){
+  if (!dadosPainel) return;
+  const box = BOX_VISAO[qual] || 'det-visao';
+  const m = dadosPainel.metricas, p = dadosPainel.periodo;
+  const g = dadosPainel.ganhos_itens || [];
+  const fr = dadosPainel.frentes;
+
+  // 1) Realizado (bruto) e Realizado c/ multiplicador: a mesma lista, outra ordem
+  if (qual === 'realizado' || qual === 'realizado_multi') {
+    const bruto = qual === 'realizado';
+    const itens = g.slice().sort((a, b) => bruto ? (b.bruto - a.bruto) : (b.multi - a.multi));
+    const comFator = itens.filter(i => i.fator != null && Math.abs(i.fator - 1) > 0.01);
+    const ganhoFator = itens.reduce((a, i) => a + ((i.multi || 0) - (i.bruto || 0)), 0);
+    abreDet(box, qual,
+      `${bruto ? 'Realizado (bruto)' : 'Realizado c/ multiplicador'} · ${
+        R(bruto ? m.real_bruto : m.real_multi)} · ${N(itens.length)} venda(s)`,
+      tabelaGanhos(itens, 'Nenhuma venda no mês.'),
+      `Ordenado pelo valor ${bruto ? 'bruto' : 'com multiplicador'}, maior primeiro.
+       ${comFator.length
+          ? `<b>${N(comFator.length)}</b> de ${N(itens.length)} venda(s) têm multiplicador
+             diferente de 1x, e é daí que vem ${sinalR(ganhoFator)} de diferença entre as
+             duas colunas.`
+          : `Nenhuma venda do mês tem multiplicador diferente de 1x — por isso as duas
+             colunas batem.`}
+       Contra a meta de ${R(m.meta_mes)} vale a coluna <b>c/ Multiplicador</b>.`);
+    return;
+  }
+
+  // 2) MTD: a curva dia a dia, que é onde se vê ONDE o atraso nasceu
+  if (qual === 'mtd') {
+    const c = (dadosPainel.curva_mtd || []).filter(x => x.e_du || x.qtd);
+    const linhas = c.map(x => `
+      <tr class="${x.dia === p.hoje ? 'mtd-hoje' : ''}${x.passado ? '' : ' mtd-futuro'}">
+        <td class="hora">${fmtDia(x.dia)}</td>
+        <td class="num">${x.e_du ? N(x.du) : '<span class="zero">—</span>'}</td>
+        <td class="num">${x.entrou ? R(x.entrou) : '<span class="zero">—</span>'}</td>
+        <td class="num">${x.qtd ? N(x.qtd) : '<span class="zero">—</span>'}</td>
+        <td class="num">${R(x.meta_acum)}</td>
+        <td class="num"><b>${R(x.real_acum)}</b></td>
+        <td class="num">${x.passado ? sinalR(x.desvio) : '<span class="zero">—</span>'}</td>
+      </tr>`).join('');
+    abreDet(box, qual,
+      `MTD — deveria estar ${R(m.deveria_mtd)} · está ${R(m.real_multi)} · ${
+        sinalR(m.real_multi - m.deveria_mtd).replace(/<[^>]+>/g, '')}`,
+      c.length ? `
+        <table>
+          <thead><tr>
+            <th>Dia</th><th class="num">DU</th><th class="num">Entrou no dia</th>
+            <th class="num">Vendas</th><th class="num">Meta acum.</th>
+            <th class="num">Real acum.</th><th class="num">Desvio</th>
+          </tr></thead>
+          <tbody>${linhas}</tbody>
+        </table>` : '<div class="det-vazio">Sem dias úteis no período.</div>',
+      `A <b>meta acumulada</b> é linear: ${R(m.meta_dia)} por dia útil (${R(m.meta_mes)} ÷
+       ${N(p.du_total)} DU). O <b>real acumulado</b> é com multiplicador. O <b>desvio</b> é a
+       distância entre os dois — negativo é atraso. Dias ainda não vividos aparecem em cinza
+       e sem desvio, só com a meta que vai cobrar. Fim de semana e feriado só aparecem se
+       entrou venda neles.`);
+    return;
+  }
+
+  // 3) Meta do dia: a conta aberta, porque é um número que ninguém confia de graça
+  if (qual === 'meta_dia') {
+    const linha = (rot, val, obs) => `
+      <tr><td>${rot}</td><td class="num"><b>${val}</b></td><td class="obs">${obs || ''}</td></tr>`;
+    const porFrente = !fr || !(fr.linhas || []).length ? '' : `
+      <table>
+        <thead><tr><th>Frente</th><th class="num">Falta</th><th class="num">Meta/dia restante</th></tr></thead>
+        <tbody>${fr.linhas.map(f => `
+          <tr><td>${esc(f.nome)}</td>
+            <td class="num">${f.gap > 0 ? `<span class="neg">${R(f.gap)}</span>`
+                                        : `<span class="pos">${R(Math.abs(f.gap))} a mais</span>`}</td>
+            <td class="num"><b>${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</b></td>
+          </tr>`).join('')}
+          <tr class="total"><td>TOTAL</td>
+            <td class="num">${R(fr.total.gap)}</td>
+            <td class="num">${R(fr.total.meta_dia_rest)}</td></tr>
+        </tbody>
+      </table>`;
+    abreDet(box, qual, `Meta do dia · ${R(m.meta_dia_ajust)} — de onde sai esse número`,
+      `<table class="conta">
+         <tbody>
+           ${linha('Meta do mês', R(m.meta_mes), 'planilha METAS')}
+           ${linha('Realizado c/ multiplicador', R(m.real_multi), `${N(m.qtd_ganhos_mes)} venda(s) até agora`)}
+           ${linha('Falta para 100%', R(m.gap_100), 'meta − realizado')}
+           ${linha('Dias úteis que sobraram', N(m.du_com_hoje),
+                   m.hoje_e_du ? 'contando hoje, que ainda dá para vender' : 'hoje não é dia útil')}
+           ${linha('<b>Meta do dia ajustada</b>', R(m.meta_dia_ajust), 'o que falta ÷ dias que sobraram')}
+           ${linha('Meta linear (referência)', R(m.meta_dia), `${R(m.meta_mes)} ÷ ${N(p.du_total)} DU do mês`)}
+         </tbody>
+       </table>${porFrente}`,
+      `A meta do dia <b>corre atrás</b>: todo dia que fecha abaixo joga a diferença para
+       dentro do gap, e o gap volta diluído nos dias que sobraram. Por isso ela sobe quando
+       o mês atrasa e cai quando adianta — diferente da meta linear, que nunca muda.
+       ${m.du_com_hoje > 0 ? '' : 'O mês já encerrou, então não há mais dia para dividir.'}`);
+    return;
+  }
+
+  // 4) Atingimento e Gap: a quebra por frente, que é onde dá para agir
+  if (qual === 'atingimento' || qual === 'gap') {
+    const ating = qual === 'atingimento';
+    const corpo = !fr || !(fr.linhas || []).length
+      ? '<div class="det-vazio">Não consegui montar a quebra por frente agora.</div>'
+      : `<table>
+          <thead><tr>
+            <th>Frente</th><th class="num">Meta</th><th class="num">Deveria (MTD)</th>
+            <th class="num">Real c/ mult.</th><th class="num">% Ating.</th>
+            <th class="num">Falta</th><th class="num">Meta/dia rest.</th>
+          </tr></thead>
+          <tbody>${fr.linhas.map(f => `
+            <tr><td>${esc(f.nome)}</td>
+              <td class="num">${f.meta > 0 ? R(f.meta) : '<span class="zero">—</span>'}</td>
+              <td class="num">${f.deveria_mtd > 0 ? R(f.deveria_mtd) : '<span class="zero">—</span>'}</td>
+              <td class="num"><b>${R(f.real_multi)}</b></td>
+              <td class="num">${pctTag(f.pct)}</td>
+              <td class="num">${f.gap > 0 ? `<span class="neg">${R(f.gap)}</span>`
+                                          : `<span class="pos">${R(Math.abs(f.gap))} a mais</span>`}</td>
+              <td class="num">${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</td>
+            </tr>`).join('')}
+            <tr class="total"><td>TOTAL</td>
+              <td class="num">${R(fr.total.meta)}</td>
+              <td class="num">${R(fr.total.deveria_mtd)}</td>
+              <td class="num">${R(fr.total.real_multi)}</td>
+              <td class="num">${pctTag(fr.total.pct)}</td>
+              <td class="num">${R(fr.total.gap)}</td>
+              <td class="num">${R(fr.total.meta_dia_rest)}</td>
+            </tr></tbody>
+         </table>`;
+    abreDet(box, qual,
+      ating ? `Atingimento ${P(m.atingimento)} · ${R(m.real_multi)} de ${R(m.meta_mes)}`
+            : `Gap 100% · ${R(m.gap_100)} para fechar ${R(m.meta_mes)}`,
+      corpo,
+      `Mesma régua do painel: real com multiplicador contra a meta da frente.
+       ${fr && fr.total && Math.abs(fr.total.meta - m.meta_mes) > 1
+          ? `<b>Atenção:</b> as frentes somam ${R(fr.total.meta)} e a meta do painel é
+             ${R(m.meta_mes)} — a diferença de ${R(Math.abs(fr.total.meta - m.meta_mes))}
+             está em METAS_FRENTES, não no Pipedrive.`
+          : 'As metas por frente somam exatamente a meta do mês.'}`);
+  }
+}
+
+// ── REUNIÕES: os 4 cards ──────────────────────────────────────
+const ROT_REU = {ontem: 'Último dia útil', hoje: 'Hoje', mes: 'Total do mês', futuras: 'Futuras'};
+
 function verReunioes(qual){
   const box = document.getElementById('det-reunioes');
   if (!box || !dadosPainel) return;
@@ -3432,13 +3829,21 @@ function verReunioes(qual){
 
   const r = dadosPainel.reunioes || {};
   if (r.dono) DONO_REU = r.dono;
-  const itens = qual === 'hoje' ? (r.lista_hoje || []) : (r.lista_ontem || []);
-  const dia = qual === 'hoje' ? dadosPainel.periodo.hoje : dadosPainel.periodo.ontem;
-  const dup = (qual === 'hoje' ? r.hoje : r.ontem)?.duplicadas_ocultas || 0;
-  const rot = qual === 'hoje' ? 'Hoje' : 'Último dia útil';
+  const itens = qual === 'hoje'  ? (r.lista_hoje  || [])
+              : qual === 'ontem' ? (r.lista_ontem || [])
+              : qual === 'mes'   ? (r.lista_mes   || [])
+              :                    (r.lista_futuras || []);
+  // mês e futuras cruzam vários dias, então a coluna Dia só aparece nesses dois
+  const multiDia = qual === 'mes' || qual === 'futuras';
+  const dia = qual === 'hoje' ? dadosPainel.periodo.hoje
+            : qual === 'ontem' ? dadosPainel.periodo.ontem : null;
+  const dup = (qual === 'hoje' ? r.hoje : qual === 'ontem' ? r.ontem : {})?.duplicadas_ocultas || 0;
+  const rot = ROT_REU[qual] || qual;
+  const val = qual === 'mes' ? (r.mes || {}) : qual === 'futuras' ? (r.futuras || {}) : null;
 
   const linhas = itens.map(i => `
     <tr>
+      ${multiDia ? `<td class="hora">${fmtDia(i.dia)}</td>` : ''}
       <td class="hora">${i.hora || '—'}</td>
       <td>${esc(i.responsavel)}</td>
       <td>${i.funil ? esc(i.funil) : '<span class="zero">—</span>'}</td>
@@ -3449,14 +3854,18 @@ function verReunioes(qual){
   box.innerHTML = `
     <div class="det-box det">
       <div class="det-head">
-        <span class="t">Reuniões — ${rot} · ${dia} · ${itens.length} registro(s)</span>
+        <span class="t">Reuniões — ${rot} · ${dia ? dia + ' · ' : ''}${itens.length} registro(s)${
+          val ? ` · ${N(val.agendadas || 0)} agendadas${
+            val.realizadas != null ? ` / ${N(val.realizadas)} validadas` : ''}` : ''}</span>
         <button class="x" onclick="verReunioes('${qual}')">fechar</button>
       </div>
       ${itens.length ? `
         <table>
-          <thead><tr><th>Hora</th><th>Responsável</th><th>Funil</th><th>Negócio</th><th>Status</th></tr></thead>
+          <thead><tr>${multiDia ? '<th>Dia</th>' : ''}<th>Hora</th><th>Responsável</th><th>Funil</th><th>Negócio</th><th>Status</th></tr></thead>
           <tbody>${linhas}</tbody>
-        </table>` : '<div class="det-vazio">Nenhuma reunião registrada nesse dia.</div>'}
+        </table>` : `<div class="det-vazio">Nenhuma reunião registrada ${
+          qual === 'futuras' ? 'depois de hoje até o fim do mês.' :
+          qual === 'mes' ? 'no mês.' : 'nesse dia.'}</div>`}
       <div class="det-nota">
         <b>Agendada</b> = negócio nos funis Navigator/MGM e quem agendou é do time${
           (r.time || []).length ? ` (${r.time.map(n => esc(n)).join(', ')})` : ''} — não importa de quem é o negócio.
