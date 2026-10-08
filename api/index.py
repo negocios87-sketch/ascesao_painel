@@ -903,6 +903,10 @@ PIPELINE_MGM = int(os.environ.get("PIPELINE_MGM", "92"))
 TAG_RENOVACAO_CAMPO = os.environ.get(
     "TAG_RENOVACAO_CAMPO", "54fc9258843cdf7ea126b6c5aca9d4dc93a3a718")
 TAG_RENOVACAO_VALOR = os.environ.get("TAG_RENOVACAO_VALOR", "Renovacao_IC")
+# Segunda porta de entrada da frente Renovação: o NOME DO PRODUTO. Lista separada
+# por vírgula, casada por "contém" depois de tirar acento e caixa — então um único
+# termo "Renovação" pega "RENOVAÇÃO PFCC", "Renovacao Board Club", "renovaçao", etc.
+PRODUTO_RENOVACAO = os.environ.get("PRODUTO_RENOVACAO", "Renovação")
 
 # ── REFERIDOS (indicações) ────────────────────────────────────
 # Um negócio é referido se a Origem contém "buzzlead" OU a tag v2 traz
@@ -960,21 +964,38 @@ def _rotulo_opcao(v, campo):
     return txt
 
 
+def _nome_produto_campo(deal, campo):
+    """O nome do produto escrito em UM campo, já traduzido de id para label."""
+    if not campo:
+        return ""
+    v = cf(deal, campo)
+    if v is None:
+        return ""
+    if isinstance(v, list):
+        return " + ".join(x for x in (_rotulo_opcao(i, campo) for i in v) if x)
+    return _rotulo_opcao(v, campo)
+
+
 def produto_do_deal(deal):
     """Nome do produto vendido. Lista primeiro (traduzindo o id), texto como reserva."""
     for campo in (CF_PRODUTO, CF_PRODUTO_ALT):
-        if not campo:
-            continue
-        v = cf(deal, campo)
-        if v is None:
-            continue
-        if isinstance(v, list):
-            nome = " + ".join(x for x in (_rotulo_opcao(i, campo) for i in v) if x)
-        else:
-            nome = _rotulo_opcao(v, campo)
+        nome = _nome_produto_campo(deal, campo)
         if nome:
             return nome
     return "(sem produto preenchido)"
+
+
+def produtos_do_deal(deal):
+    """
+    TODOS os nomes de produto do negócio, dos dois campos, não só o primeiro.
+
+    produto_do_deal() para no primeiro campo preenchido — serve para exibir. Para
+    CLASSIFICAR (ex.: achar "Renovação" no nome) isso perde informação: se o campo
+    de lista tem "PFCC" e o de texto livre tem "Renovação PFCC", só o primeiro
+    apareceria e a renovação passaria batido.
+    """
+    return [n for n in (_nome_produto_campo(deal, c)
+                        for c in (CF_PRODUTO, CF_PRODUTO_ALT)) if n]
 
 # Só negócios nesta etapa entram na previsão (20/50/70) e no pipe do dia.
 # Casa por trecho do nome, então "Negocia" pega "Negociação" em qualquer funil.
@@ -1063,10 +1084,37 @@ def tags_do_campo(deal, campo):
 
 
 def eh_renovacao(deal):
-    """True se o negócio carrega a tag de Renovação."""
-    if not TAG_RENOVACAO_CAMPO or not TAG_RENOVACAO_VALOR:
-        return False
-    return bool(tags_do_campo(deal, TAG_RENOVACAO_CAMPO) & valores_tag_renovacao())
+    """
+    True se o negócio é da frente Renovação. Duas portas, em OU:
+
+      1. a TAG de Renovação no campo personalizado (regra original)
+      2. o NOME DO PRODUTO contém "renovacao" (regra pedida em out/26)
+
+    A comparação do produto passa por norm(), que tira acento e caixa — então
+    "Renovação", "RENOVAÇÃO", "Renovacao" e "renovaçao" casam igual. Olha os dois
+    campos de produto, não só o primeiro preenchido.
+    """
+    if TAG_RENOVACAO_CAMPO and TAG_RENOVACAO_VALOR:
+        if tags_do_campo(deal, TAG_RENOVACAO_CAMPO) & valores_tag_renovacao():
+            return True
+    return bool(motivo_renovacao_produto(deal))
+
+
+def termos_renovacao_produto():
+    """Trechos que, achados no nome do produto, marcam o negócio como Renovação."""
+    return [t for t in (norm(x) for x in PRODUTO_RENOVACAO.split(",")) if t]
+
+
+def motivo_renovacao_produto(deal):
+    """O nome do produto que disparou a regra, ou '' se nenhum disparou."""
+    termos = termos_renovacao_produto()
+    if not termos:
+        return ""
+    for nome in produtos_do_deal(deal):
+        n = norm(nome)
+        if any(t in n for t in termos):
+            return nome
+    return ""
 
 
 def eh_referido(deal):
@@ -1854,6 +1902,7 @@ def calcular_navigator(mes=None, ano=None):
             resumo_frentes = {
                 "linhas": r_fr["frentes"], "total": r_fr["total"],
                 "tag_renovacao_ativa": r_fr["tag_renovacao_ativa"],
+                "regra_renovacao": r_fr.get("regra_renovacao"),
                 "meta_planilha": r_fr["meta_planilha"],
                 "alertas": r_fr["alertas"],
             }
@@ -2022,9 +2071,34 @@ def calcular_resumo(mes=None, ano=None):
         erro_mgm = f"{type(e).__name__}: {e}"
 
     tag_ativa = bool(TAG_RENOVACAO_CAMPO and TAG_RENOVACAO_VALOR)
+    produto_ativo = bool(termos_renovacao_produto())
     # o pipe considerado é só o da etapa de Negociação
     abertos_nav_neg, filtrou_etapa = so_em_negociacao(abertos_nav)
     abertos_mgm_neg, _ = so_em_negociacao(abertos_mgm)
+
+    # De onde veio cada renovação: da TAG ou do NOME DO PRODUTO. A frente viveu
+    # zerada durante meses porque a tag nunca era aplicada — com duas portas, saber
+    # qual delas está puxando é a diferença entre confiar e desconfiar do número.
+    def _origem_renov(lista):
+        por_tag = por_produto = ambas = 0
+        exemplos = {}
+        for d in lista:
+            t = bool(TAG_RENOVACAO_CAMPO and TAG_RENOVACAO_VALOR
+                     and (tags_do_campo(d, TAG_RENOVACAO_CAMPO) & valores_tag_renovacao()))
+            p = motivo_renovacao_produto(d)
+            if not t and not p:
+                continue
+            if t and p:
+                ambas += 1
+            elif t:
+                por_tag += 1
+            else:
+                por_produto += 1
+            if p:
+                exemplos[p] = exemplos.get(p, 0) + 1
+        return {"por_tag": por_tag + ambas, "por_produto": por_produto + ambas,
+                "por_ambas": ambas, "so_produto": por_produto, "so_tag": por_tag,
+                "produtos": dict(sorted(exemplos.items(), key=lambda kv: -kv[1])[:8])}
 
     grupos = {
         "navigator": {
@@ -2108,10 +2182,10 @@ def calcular_resumo(mes=None, ano=None):
     if not filtrou_etapa and ETAPA_PREVISAO:
         alertas.append(f"Nenhuma etapa com \"{ETAPA_PREVISAO}\" no nome foi encontrada — "
                        "o pipe está considerando todas as etapas.")
-    if not tag_ativa:
-        alertas.append("A tag de Renovação ainda não foi configurada — a frente aparece zerada "
-                       "e o Navigator está vindo inteiro. Preencha TAG_RENOVACAO_CAMPO e "
-                       "TAG_RENOVACAO_VALOR nas variáveis de ambiente.")
+    if not tag_ativa and not produto_ativo:
+        alertas.append("Nem a tag nem o nome do produto estão configurados para Renovação — "
+                       "a frente aparece zerada e o Navigator está vindo inteiro. Preencha "
+                       "TAG_RENOVACAO_CAMPO/TAG_RENOVACAO_VALOR ou PRODUTO_RENOVACAO.")
     if not metas_mes:
         alertas.append(f"Não tenho metas por frente cadastradas para {mes:02d}/{ano} — "
                        "as metas do resumo vieram zeradas.")
@@ -2134,6 +2208,14 @@ def calcular_resumo(mes=None, ano=None):
         "projecao": projecao,
         "meta_planilha": arred(meta_planilha),
         "tag_renovacao_ativa": tag_ativa,
+        "regra_renovacao": {
+            "tag_ativa": tag_ativa,
+            "tag": TAG_RENOVACAO_VALOR if tag_ativa else None,
+            "produto_ativo": produto_ativo,
+            "termos_produto": _lista_nomes(PRODUTO_RENOVACAO) if produto_ativo else [],
+            "ganhos": _origem_renov(grupos["renovacao"]["ganhos"]),
+            "abertos": _origem_renov(grupos["renovacao"]["abertos"]),
+        },
         "etapa_previsao": ETAPA_PREVISAO if filtrou_etapa else None,
         "alertas": alertas,
     }
@@ -3390,6 +3472,39 @@ function render(d){
                  bSemana +
                  bReferidos + `<div id="det-referidos"></div>` + notaComp;
 
+  // Renovação entra por duas portas (tag OU nome do produto). Dizer quantos vieram
+  // de cada uma evita a pergunta "esse número tá certo?" e, mais importante, mostra
+  // na hora se a tag parou de ser aplicada — foi o que deixou a frente zerada antes.
+  const notaRenovacao = rr => {
+    if (!rr) return '';
+    const g = rr.ganhos || {}, a = rr.abertos || {};
+    const regras = [];
+    if (rr.tag_ativa) regras.push(`tag <b>${esc(rr.tag)}</b>`);
+    if (rr.produto_ativo) regras.push(`nome do produto contendo <b>${
+      (rr.termos_produto || []).map(t => esc(t)).join('</b> ou <b>')}</b>`);
+    if (!regras.length) return '';
+    const vindos = (x, rot) => {
+      const tot = (x.so_tag || 0) + (x.so_produto || 0) + (x.por_ambas || 0);
+      if (!tot) return `nenhum negócio ${rot}`;
+      const p = [];
+      if (x.so_tag)     p.push(`${N(x.so_tag)} só pela tag`);
+      if (x.so_produto) p.push(`${N(x.so_produto)} só pelo produto`);
+      if (x.por_ambas)  p.push(`${N(x.por_ambas)} pelas duas`);
+      return `${N(tot)} ${rot} (${p.join(', ')})`;
+    };
+    const prods = Object.entries(g.produtos || {});
+    return `
+      <div class="nota-comp"><b>Renovação</b> entra por ${regras.join(' <b>ou</b> ')},
+        sem acento e sem diferenciar maiúscula. No mês: ${vindos(g, 'ganho(s)')} ·
+        ${vindos(a, 'em aberto')}.${
+        prods.length ? ` Produtos que dispararam a regra: ${
+          prods.map(([p, q]) => `${esc(p)} (${N(q)})`).join(', ')}.` : ''}${
+        rr.tag_ativa && !((g.so_tag || 0) + (g.por_ambas || 0)) && (g.so_produto || 0)
+          ? ` <b>Atenção:</b> nenhuma venda de Renovação veio pela tag este mês — todas
+              entraram pelo nome do produto. Ou a tag parou de ser aplicada no Pipedrive,
+              ou ela virou redundante.` : ''}</div>`;
+  };
+
   // ── POR FRENTE (veio da antiga aba "Resumo — 3 Frentes") ──
   let frentesHtml = '';
   const fr = d.frentes;
@@ -3422,7 +3537,7 @@ function render(d){
             <tbody>${fr.linhas.map(f => linhaFr(f)).join('')}${linhaFr(fr.total, 'total')}</tbody>
           </table>
         </div>
-      </div>`;
+      </div>${notaRenovacao(fr.regra_renovacao)}`;
   }
 
   // ── closers ──
