@@ -1100,6 +1100,32 @@ def eh_renovacao(deal):
     return bool(motivo_renovacao_produto(deal))
 
 
+def frente_do_deal(deal, padrao="navigator"):
+    """
+    A frente do negócio — UMA regra, UM lugar.
+
+    Esta precedência estava copiada em quatro funções (painel, resumo, gráficos e
+    forecast) e em todas elas o funil era aplicado DEPOIS, sobrescrevendo. Resultado:
+    um produto de Renovação vendido pelo funil do MGM aparecia como MGM. Agora a
+    ordem é explícita e vale para todo mundo:
+
+      1. Renovação ganha de tudo — tag OU nome do produto, em qualquer funil
+      2. senão, o funil decide: MGM se for o pipeline do MGM
+      3. senão, Navigator
+
+    `padrao` é a rede para negócio que vem sem pipeline_id no payload: quem chamou
+    sabe de qual busca o negócio saiu.
+    """
+    if eh_renovacao(deal):
+        return "renovacao"
+    pid = deal.get("pipeline_id")
+    if pid is None:
+        return padrao
+    if PIPELINE_MGM and pid == PIPELINE_MGM:
+        return "mgm"
+    return "navigator"
+
+
 def termos_renovacao_produto():
     """Trechos que, achados no nome do produto, marcam o negócio como Renovação."""
     return [t for t in (norm(x) for x in PRODUTO_RENOVACAO.split(",")) if t]
@@ -1607,10 +1633,12 @@ def calcular_navigator(mes=None, ano=None):
     # Todo número grande do Painel do Mês passa a ter a lista que o gerou. Sem isso
     # o painel é um oráculo: diz "R$ 83.400" e ninguém sabe de quais negócios.
     frente_de = {}
+    # Renovação ganha do funil: ver frente_do_deal(). Por isso os dois laços usam a
+    # MESMA função e o do MGM não sobrescreve mais quem é renovação.
     for d in ganhos_nav + abertos_nav:
-        frente_de[d.get("id")] = "renovacao" if eh_renovacao(d) else "navigator"
+        frente_de[d.get("id")] = frente_do_deal(d, "navigator")
     for d in ganhos_mgm + abertos_mgm:
-        frente_de[d.get("id")] = "mgm"
+        frente_de[d.get("id")] = frente_do_deal(d, "mgm")
 
     def _item_ganho(d):
         v = float(d.get("value") or 0)
@@ -2100,17 +2128,17 @@ def calcular_resumo(mes=None, ano=None):
                 "por_ambas": ambas, "so_produto": por_produto, "so_tag": por_tag,
                 "produtos": dict(sorted(exemplos.items(), key=lambda kv: -kv[1])[:8])}
 
-    grupos = {
-        "navigator": {
-            "ganhos":  [d for d in ganhos_nav if not eh_renovacao(d)],
-            "abertos": [d for d in abertos_nav_neg if not eh_renovacao(d)],
-        },
-        "mgm": {"ganhos": ganhos_mgm, "abertos": abertos_mgm_neg},
-        "renovacao": {
-            "ganhos":  [d for d in ganhos_nav if eh_renovacao(d)],
-            "abertos": [d for d in abertos_nav_neg if eh_renovacao(d)],
-        },
-    }
+    # Cada negócio cai em UMA frente, pela mesma régua do resto do painel
+    # (frente_do_deal: Renovação ganha do funil). Antes o MGM entrava inteiro aqui,
+    # então renovação vendida pelo MGM nunca chegava na frente Renovação.
+    grupos = {k: {"ganhos": [], "abertos": []}
+              for k in ("navigator", "mgm", "renovacao")}
+    for lista, origem, balde in ((ganhos_nav, "navigator", "ganhos"),
+                                 (ganhos_mgm, "mgm", "ganhos"),
+                                 (abertos_nav_neg, "navigator", "abertos"),
+                                 (abertos_mgm_neg, "mgm", "abertos")):
+        for d in lista:
+            grupos[frente_do_deal(d, origem)][balde].append(d)
 
     metas_mes = METAS_FRENTES.get((ano, mes), {})
     frentes = []
@@ -2273,10 +2301,12 @@ def calcular_graficos(mes=None, ano=None):
 
     # negócio -> frente
     frente_por_deal = {}
+    # Renovação ganha do funil: ver frente_do_deal(). Por isso os dois laços usam a
+    # MESMA função e o do MGM não sobrescreve mais quem é renovação.
     for d in ganhos_nav + abertos_nav:
-        frente_por_deal[d.get("id")] = "renovacao" if eh_renovacao(d) else "navigator"
+        frente_por_deal[d.get("id")] = frente_do_deal(d, "navigator")
     for d in ganhos_mgm + abertos_mgm:
-        frente_por_deal[d.get("id")] = "mgm"
+        frente_por_deal[d.get("id")] = frente_do_deal(d, "mgm")
 
     ultimo = cal_mod.monthrange(ano, mes)[1]
     dias = [date(ano, mes, d).strftime("%Y-%m-%d") for d in range(1, ultimo + 1)]
@@ -2380,12 +2410,10 @@ def calcular_graficos(mes=None, ano=None):
             if dia not in perdidos["navigator"]:      # fora do mês pedido
                 continue
             pid_d = d.get("pipeline_id")
-            if pid_d == PIPELINE_MGM:
-                f = "mgm"
-            elif pid_d == pid:
-                f = "renovacao" if eh_renovacao(d) else "navigator"
-            else:
+            if pid_d not in (PIPELINE_MGM, pid):
                 continue                               # funil fora do escopo
+            # mesma régua dos ganhos: Renovação ganha do funil
+            f = frente_do_deal(d, "mgm" if pid_d == PIPELINE_MGM else "navigator")
             perdidos[f][dia] += 1
             perdidos_total[f] += 1
             motivo = (d.get("lost_reason") or "").strip() or "(sem motivo preenchido)"
@@ -2540,10 +2568,12 @@ def calcular_forecast(mes=None, ano=None):
     abertos, filtrou_etapa = so_em_negociacao(abertos_todos)
 
     frente_por_deal = {}
+    # Renovação ganha do funil: ver frente_do_deal(). Por isso os dois laços usam a
+    # MESMA função e o do MGM não sobrescreve mais quem é renovação.
     for d in ganhos_nav + abertos_nav:
-        frente_por_deal[d.get("id")] = "renovacao" if eh_renovacao(d) else "navigator"
+        frente_por_deal[d.get("id")] = frente_do_deal(d, "navigator")
     for d in ganhos_mgm + abertos_mgm:
-        frente_por_deal[d.get("id")] = "mgm"
+        frente_por_deal[d.get("id")] = frente_do_deal(d, "mgm")
 
     ultimo = cal_mod.monthrange(ano, mes)[1]
     dias = [date(ano, mes, i).strftime("%Y-%m-%d") for i in range(1, ultimo + 1)]
