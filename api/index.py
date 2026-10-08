@@ -1100,6 +1100,37 @@ def eh_renovacao(deal):
     return bool(motivo_renovacao_produto(deal))
 
 
+def sem_multiplicador(deal):
+    """
+    True quando a venda tem valor mas o campo Multiplicador está vazio.
+
+    Isso é silencioso e caro: é o multiplicador que bate contra a meta, então uma
+    venda sem ele entra como R$ 0 no atingimento. O bruto aparece, a meta não anda,
+    e ninguém entende por quê.
+    """
+    if float(deal.get("value") or 0) <= 0:
+        return False
+    return float(cf(deal, CF_MULTIPLICADOR) or 0) <= 0
+
+
+def resumo_sem_multi(deals, users=None, limite=12):
+    """Quantas vendas estão sem multiplicador, quanto isso esconde, e quais são."""
+    faltando = [d for d in deals if sem_multiplicador(d)]
+    itens = [{
+        "id": d.get("id"),
+        "titulo": d.get("title") or "(sem título)",
+        "dono": (owner_name(d, users) if users else None) or "— sem dono —",
+        "valor": arred(float(d.get("value") or 0)),
+        "dia": won_time_br(d)[:10] or None,
+        "url": f"https://boardacademy.pipedrive.com/deal/{d.get('id')}",
+    } for d in sorted(faltando, key=lambda x: -float(x.get("value") or 0))[:limite]]
+    return {
+        "qtd": len(faltando),
+        "bruto": arred(sum(float(d.get("value") or 0) for d in faltando)),
+        "itens": itens,
+    }
+
+
 def frente_do_deal(deal, padrao="navigator"):
     """
     A frente do negócio — UMA regra, UM lugar.
@@ -1622,6 +1653,10 @@ def calcular_navigator(mes=None, ano=None):
         "ticket_medio_equipe":       arred(safe_div(real_bruto_equipe, len(ganhos_equipe))) if ganhos_equipe else 0.0,
     }
 
+    # Venda com o Multiplicador em branco entra como R$ 0 contra a meta. Fica aqui
+    # para o painel poder avisar em vez de só mostrar um número menor do que deveria.
+    metricas["sem_multi"] = resumo_sem_multi(ganhos, users)
+
     # ── Forecast de hoje em diante (bloco "Forecast" do painel) ──
     import calendar as _cal_fx
     _ult = _cal_fx.monthrange(ano, mes)[1]
@@ -1652,6 +1687,7 @@ def calcular_navigator(mes=None, ano=None):
             "bruto": arred(v),
             "multi": arred(mv),
             "fator": arred(safe_div(mv, v)) if v else None,
+            "sem_multi": sem_multiplicador(d),
             "frente": frente_de.get(did) or "navigator",
             "produto": produto_do_deal(d),
             "url": f"https://boardacademy.pipedrive.com/deal/{did}",
@@ -1972,6 +2008,13 @@ def calcular_navigator(mes=None, ano=None):
         alertas.append("Não consegui calcular as métricas de SDR agora — " + erro_sdr)
     if erro_reu:
         alertas.append("Não consegui contar as reuniões agora — " + erro_reu)
+    sm = metricas["sem_multi"]
+    if sm["qtd"]:
+        val = f"{sm['bruto']:,.0f}".replace(",", ".")
+        alertas.append(
+            f"{sm['qtd']} venda(s) ganha(s) no mês estão com o campo Multiplicador em "
+            f"branco. São R$ {val} de bruto que entram como ZERO no atingimento — "
+            "é o número da meta que fica menor do que deveria.")
     for chave in ("sem_data", "sem_probabilidade", "prob_fora"):
         r = pend["resumo"][chave]
         if r["qtd"]:
@@ -2471,7 +2514,11 @@ def calcular_graficos(mes=None, ano=None):
             "meta": arred(meta_f),
             "bruto": arred(bruto), "multi": arred(multi),
             "pct": arred(safe_div(multi, meta_f) * 100) if meta_f else None,
+            "pct_bruto": arred(safe_div(bruto, meta_f) * 100) if meta_f else None,
             "vendas": len(deals_f),
+            # venda sem multiplicador entra como zero no atingimento — é o que fazia
+            # "2 vendas de 990" virar "R$ 990" no card
+            "sem_multi": resumo_sem_multi(deals_f, users),
             "reunioes": sum(reunioes[k].values()),
             "deals_com_reuniao": len(com_reu[k]),
             "deals_ganhos": len(ganhou[k]),
@@ -3046,6 +3093,11 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard.forte{border-left-width:4px}
   .kcard .val.pos{color:var(--green)}
   .kcard .val.neg{color:var(--red)}
+  /* alertinha de dado faltando: avisa sem virar carnaval */
+  .aviso-multi{margin-top:6px;padding:4px 8px;border-radius:4px;background:var(--amber-bg);
+               border:1px solid #F0D9A8;color:var(--amber);font-size:10px;font-weight:700;
+               line-height:1.35;cursor:help}
+  .det .aviso-multi{display:inline-block;margin:0;font-size:9px;padding:1px 6px}
 
   /* BLOCOS — uma linha por assunto */
   .bloco{margin-bottom:18px}
@@ -3426,7 +3478,10 @@ function render(d){
          detV('realizado')) +
     card('forte', 'Realizado c/ multiplicador', R(m.real_multi),
          'é este que bate contra a meta' +
-         soEq(m.real_multi_equipe !== m.real_multi ? R(m.real_multi_equipe) : ''),
+         soEq(m.real_multi_equipe !== m.real_multi ? R(m.real_multi_equipe) : '') +
+         ((m.sem_multi || {}).qtd
+           ? `<div class="aviso-multi">⚠ ${N(m.sem_multi.qtd)} venda(s) sem multiplicador ·
+              ${R(m.sem_multi.bruto)} entrando como zero</div>` : ''),
          detV('realizado_multi')) +
     card('', 'MTD — deveria estar', R(m.deveria_mtd),
          `${P(m.pct_mes_decorrido)} do mês decorrido`, detV('mtd')));
@@ -3819,8 +3874,10 @@ function tabelaGanhos(itens, vazio){
       <td>${tagFr(i.frente)}</td>
       <td>${esc(i.produto)}</td>
       <td class="num">${R(i.bruto)}</td>
-      <td class="num"><b>${R(i.multi)}</b>${
-        temFator ? ` <span class="gt-eq">${i.fator.toFixed(2).replace('.',',')}x</span>` : ''}</td>
+      <td class="num">${i.sem_multi
+        ? '<span class="aviso-multi">⚠ em branco</span>'
+        : `<b>${R(i.multi)}</b>${
+            temFator ? ` <span class="gt-eq">${i.fator.toFixed(2).replace('.',',')}x</span>` : ''}`}</td>
     </tr>`;
   }).join('');
   return `
@@ -3924,7 +3981,14 @@ function verVisao(qual){
              duas colunas.`
           : `Nenhuma venda do mês tem multiplicador diferente de 1x — por isso as duas
              colunas batem.`}
-       Contra a meta de ${R(m.meta_mes)} vale a coluna <b>c/ Multiplicador</b>.`);
+       Contra a meta de ${R(m.meta_mes)} vale a coluna <b>c/ Multiplicador</b>.${
+       (m.sem_multi || {}).qtd
+         ? `<br>⚠ <b>${N(m.sem_multi.qtd)} venda(s)</b> estão com o campo em branco no
+            Pipedrive (marcadas na tabela): ${R(m.sem_multi.bruto)} de bruto que contam
+            <b>zero</b> contra a meta. É preenchimento, não venda perdida —
+            ${(m.sem_multi.itens || []).slice(0, 5).map(i =>
+              `<a href="${i.url}" target="_blank" rel="noopener">${esc(i.titulo)}</a> (${R(i.valor)})`
+             ).join(', ')}${m.sem_multi.qtd > 5 ? ` e mais ${N(m.sem_multi.qtd - 5)}` : ''}.` : ''}`);
     return;
   }
 
@@ -4358,14 +4422,25 @@ function renderGraficos(d){
   const fr = d.frentes;
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
 
-  const cardsAting = d.atingimento.map(a => `
+  // O card mostra o valor COM multiplicador, que é o que bate contra a meta. Quando
+  // alguma venda está sem o campo preenchido ela entra como zero, e o card fica menor
+  // que o bruto sem explicação — foi assim que "2 vendas de 990" virou "R$ 990".
+  const cardsAting = d.atingimento.map(a => {
+    const sm = a.sem_multi || {};
+    const difere = a.bruto != null && Math.abs(a.bruto - a.multi) > 1;
+    return `
     <div class="kcard">
       <div class="rot">${esc(a.nome)}</div>
       <div class="val">${a.pct == null ? '—' : P(a.pct)}</div>
-      <div class="sub">${R(a.multi)} de ${R(a.meta)}<br>
+      <div class="sub">${R(a.multi)} de ${R(a.meta)}${
+        difere ? ` <span class="hint">· bruto ${R(a.bruto)}</span>` : ''}<br>
         ${N(a.vendas)} venda(s) · ${N(a.reunioes)} reunião(ões) validada(s)<br>
-        conversão ${P(a.conversao)} <span class="hint">${N(a.deals_ganhos)} de ${N(a.deals_com_reuniao)} negócio(s)</span></div>
-    </div>`).join('');
+        conversão ${P(a.conversao)} <span class="hint">${N(a.deals_ganhos)} de ${N(a.deals_com_reuniao)} negócio(s)</span>${
+        sm.qtd ? `<div class="aviso-multi" title="${esc((sm.itens || [])
+            .map(i => `${i.titulo} — ${R(i.valor)}`).join(' · '))}">⚠ ${N(sm.qtd)} venda(s)
+            sem multiplicador · ${R(sm.bruto)} fora da conta</div>` : ''}</div>
+    </div>`;
+  }).join('');
 
   const cm = d.conversao_mes || {};
 
