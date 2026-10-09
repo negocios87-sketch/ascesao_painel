@@ -2419,16 +2419,33 @@ def calcular_graficos(mes=None, ano=None):
             continue
         f = frente_por_deal.get(d.get("id"), "navigator")
         nome_p = produto_do_deal(d)
-        acc = prod[f].setdefault(nome_p, {"valor": 0.0, "multi": 0.0, "qtd": 0})
-        acc["valor"] += float(d.get("value") or 0)
+        acc = prod[f].setdefault(nome_p, {"valor": 0.0, "multi": 0.0, "qtd": 0, "itens": []})
+        v_ = float(d.get("value") or 0)
+        acc["valor"] += v_
         acc["multi"] += float(cf(d, CF_MULTIPLICADOR) or 0)
         acc["qtd"] += 1
+        # os negócios por trás da linha: é o que o hover da tabela mostra, para dar
+        # para ver se as 10 vendas do mesmo produto saíram todas pelo mesmo preço
+        acc["itens"].append({
+            "id": d.get("id"),
+            "titulo": d.get("title") or "(sem título)",
+            "dono": owner_name(d, users) or "— sem dono —",
+            "bruto": arred(v_),
+            "dia": dia,
+            "sem_multi": sem_multiplicador(d),
+        })
 
     tabelas_produto = {}
     for k in chaves:
         linhas = [{"produto": p_, "valor": arred(v["valor"]), "multi": arred(v["multi"]),
                    "volume": v["qtd"],
-                   "ticket": arred(safe_div(v["valor"], v["qtd"])) if v["qtd"] else 0.0}
+                   "ticket": arred(safe_div(v["valor"], v["qtd"])) if v["qtd"] else 0.0,
+                   # maior primeiro: o hover serve para achar o fora da curva
+                   "itens": sorted(v["itens"], key=lambda x: -x["bruto"]),
+                   # o ticket médio esconde dispersão; isto diz se o preço variou
+                   "preco_unico": len({i["bruto"] for i in v["itens"]}) == 1,
+                   "bruto_min": arred(min(i["bruto"] for i in v["itens"])) if v["itens"] else 0.0,
+                   "bruto_max": arred(max(i["bruto"] for i in v["itens"])) if v["itens"] else 0.0}
                   for p_, v in prod[k].items()]
         linhas.sort(key=lambda x: -x["valor"])
         tot_v = sum(l["valor"] for l in linhas)
@@ -3093,6 +3110,34 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard.forte{border-left-width:4px}
   .kcard .val.pos{color:var(--green)}
   .kcard .val.neg{color:var(--red)}
+  /* hover das linhas de produto: flutuante, sóbrio, sem roubar o clique */
+  .linha-prod{cursor:default}
+  .linha-prod:hover td{background:#F4F6FB}
+  .pt-varia{margin-left:5px;color:var(--amber);font-weight:800;cursor:help}
+  .tip-prod{position:fixed;z-index:9999;pointer-events:none;max-width:560px;
+            background:var(--white);border:1px solid var(--border);border-radius:7px;
+            box-shadow:0 6px 20px rgba(26,26,46,.16);overflow:hidden}
+  .tip-prod[hidden]{display:none}
+  .tip-prod .tp-head{background:var(--navy);color:#fff;font-size:11px;font-weight:700;
+                     padding:7px 11px;letter-spacing:.3px}
+  .tip-prod .tp-sub{display:block;color:var(--gold);font-size:10px;font-weight:600;margin-top:2px}
+  .tip-prod .tp-tab{border-collapse:collapse;width:100%}
+  .tip-prod .tp-tab td{padding:5px 11px;font-size:11px;border-bottom:1px solid #EFF1F4;
+                       white-space:nowrap}
+  .tip-prod .tp-tab tr:last-child td{border-bottom:none}
+  .tip-prod .tp-dia{color:var(--muted);font-variant-numeric:tabular-nums}
+  .tip-prod .tp-id{color:var(--muted);font-size:10px}
+  .tip-prod .tp-tit{color:var(--navy);font-weight:600;max-width:230px;overflow:hidden;
+                    text-overflow:ellipsis}
+  .tip-prod .tp-dono{color:#43586F}
+  .tip-prod .tp-val{text-align:right;font-weight:700;color:var(--navy);
+                    font-variant-numeric:tabular-nums}
+  .tip-prod .tp-flag{color:var(--amber)}
+  .tip-prod .tp-mais{padding:5px 11px;font-size:10px;color:var(--muted);background:#FAFBFD}
+  .tip-prod .tp-pe{padding:7px 11px;font-size:10px;color:var(--muted);
+                   border-top:1px solid var(--border);background:#FAFBFD;white-space:normal}
+  .tip-prod .tp-pe b{color:var(--navy)}
+
   /* alertinha de dado faltando: avisa sem virar carnaval */
   .aviso-multi{margin-top:6px;padding:4px 8px;border-radius:4px;background:var(--amber-bg);
                border:1px solid #F0D9A8;color:var(--amber);font-size:10px;font-weight:700;
@@ -4417,8 +4462,79 @@ function baseEmpilhado(rotulos, series, opts){
   };
 }
 
+// ── HOVER DAS LINHAS DE PRODUTO ───────────────────────────────
+// A pergunta é "as 10 vendas de Advisor saíram todas pelo mesmo valor?". O ticket
+// médio não responde isso — esconde justamente a dispersão. Então o hover mostra
+// os negócios um a um. É flutuante e sem clique de propósito: passou o mouse, viu,
+// tirou. Nada de painel fixo empurrando a página.
+let dadosGraficos = null;
+
+function caixaTip(){
+  let el = document.getElementById('tip-prod');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'tip-prod';
+    el.className = 'tip-prod';
+    (document.body || document.documentElement).appendChild(el);
+  }
+  return el;
+}
+
+function moveTip(ev){
+  const el = document.getElementById('tip-prod');
+  if (!el || el.hidden) return;
+  const margem = 14;
+  const lg = el.offsetWidth || 320, al = el.offsetHeight || 180;
+  const maxX = (window.innerWidth || 1200) - lg - 8;
+  const maxY = (window.innerHeight || 800) - al - 8;
+  // vira para o outro lado do cursor quando não cabe — senão o tooltip some na borda
+  let x = ev.clientX + margem, y = ev.clientY + margem;
+  if (x > maxX) x = Math.max(8, ev.clientX - lg - margem);
+  if (y > maxY) y = Math.max(8, ev.clientY - al - margem);
+  el.style.left = x + 'px';
+  el.style.top  = y + 'px';
+}
+
+function escondeTip(){
+  const el = document.getElementById('tip-prod');
+  if (el) { el.hidden = true; el.innerHTML = ''; }
+}
+
+function tipProduto(ev, frente, idx){
+  const t = ((dadosGraficos || {}).produtos || {})[frente];
+  const l = t && (t.linhas || [])[idx];
+  if (!l) return;
+  const itens = l.itens || [];
+  const MAX = 14;
+  const linhas = itens.slice(0, MAX).map(i => `
+    <tr>
+      <td class="tp-dia">${fmtDia(i.dia)}</td>
+      <td class="tp-id">#${i.id}</td>
+      <td class="tp-tit">${esc(i.titulo)}</td>
+      <td class="tp-dono">${esc(i.dono)}</td>
+      <td class="tp-val">${R(i.bruto)}${i.sem_multi ? ' <span class="tp-flag">⚠</span>' : ''}</td>
+    </tr>`).join('');
+
+  const el = caixaTip();
+  el.innerHTML = `
+    <div class="tp-head">${esc(l.produto)}
+      <span class="tp-sub">${N(l.volume)} venda(s) · ${R(l.valor)} bruto</span></div>
+    <table class="tp-tab"><tbody>${linhas}</tbody></table>
+    ${itens.length > MAX ? `<div class="tp-mais">… e mais ${N(itens.length - MAX)} venda(s)</div>` : ''}
+    <div class="tp-pe">${
+      l.volume <= 1 ? 'Venda única.'
+      : l.preco_unico
+        ? `Todas as ${N(l.volume)} saíram por <b>${R(l.bruto_max)}</b>.`
+        : `Preço <b>varia</b>: de ${R(l.bruto_min)} a ${R(l.bruto_max)} · ticket médio ${R(l.ticket)}.`}${
+      itens.some(i => i.sem_multi) ? ' <span class="tp-flag">⚠</span> = sem multiplicador.' : ''}</div>`;
+  el.hidden = false;
+  moveTip(ev);
+}
+
 function renderGraficos(d){
   destroiCharts();
+  dadosGraficos = d;
+  escondeTip();
   const fr = d.frentes;
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
 
@@ -4450,9 +4566,12 @@ function renderGraficos(d){
     const t = pr[k];
     if (!t) return '';
     const corpo = t.linhas.length
-      ? t.linhas.map(l => `
-          <tr>
-            <td class="mot">${esc(l.produto)}</td>
+      ? t.linhas.map((l, i) => `
+          <tr class="linha-prod" onmouseenter="tipProduto(event,'${k}',${i})"
+              onmousemove="moveTip(event)" onmouseleave="escondeTip()">
+            <td class="mot">${esc(l.produto)}${
+              l.volume > 1 && l.preco_unico === false
+                ? '<span class="pt-varia" title="as vendas saíram por preços diferentes">~</span>' : ''}</td>
             <td class="num">${R(l.valor)}</td>
             <td class="num">${N(l.volume)}</td>
             <td class="num">${R(l.ticket)}</td>
@@ -4478,7 +4597,8 @@ function renderGraficos(d){
   };
   const tabelasProduto = `
     <div class="block-title">Produtos vendidos por frente<div class="rule"></div>
-      <span class="peso-nota">valor bruto · ticket = valor ÷ volume</span>
+      <span class="peso-nota">valor bruto · ticket = valor ÷ volume ·
+        passe o mouse na linha para ver as vendas uma a uma · <b>~</b> = preço variou</span>
     </div>
     <div class="perda-grid">${fr.map(f => tabelaProduto(f.chave)).join('')}</div>`;
 
