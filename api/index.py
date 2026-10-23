@@ -84,6 +84,18 @@ def metas_closers_config():
         if n and v:
             out[n] = v
     return out
+# ── Piso do ticket médio ──────────────────────────────────────
+# Só vendas a partir deste valor entram no CÁLCULO do ticket médio. O resto do
+# painel (soma, volume, meta) continua contando TUDO — isto muda só o ticket.
+#
+# Por quê: entram no funil negócios zerados, reservas de R$ 497 e parcelas "1/2",
+# que são vendas de verdade mas não são preço de produto. Em out/26 elas puxavam o
+# ticket do Navigator de R$ 10.338 para R$ 4.166.
+#
+# O preço cheio de COAUTORIA é exatamente R$ 5.000, então o corte é ">=", não ">".
+# Pôr 0 aqui desliga o piso e volta ao ticket sobre todas as vendas.
+TICKET_MINIMO = float(os.environ.get("TICKET_MINIMO", "5000") or 0)
+
 # Só as pendências deste dono aparecem na seção "Pipe a arrumar" (vazio = todos)
 # Donos cujo pipe entra na lista "Pipe a arrumar". Aceita lista separada por vírgula.
 PENDENCIAS_DONO = os.environ.get("PENDENCIAS_DONO", "Denise Mussolin,Mylena Oliveira,Alessandra Costa")
@@ -149,6 +161,36 @@ def safe_div(a, b):
         return float(a) / float(b) if b else 0.0
     except Exception:
         return 0.0
+
+
+def ticket_de(valores):
+    """
+    Ticket médio com o piso de TICKET_MINIMO.
+
+    Devolve SEMPRE (ticket, qtd_no_ticket, qtd_total) — os três juntos de propósito.
+    Mostrar "77 vendas · ticket R$ 10.338" quando o ticket saiu de 23 delas é mentira
+    por omissão; quem lê precisa ver sobre quantas vendas a conta foi feita.
+    """
+    vals = []
+    for v in valores:
+        try:
+            vals.append(float(v or 0))
+        except Exception:
+            vals.append(0.0)
+    elegiveis = [v for v in vals if v >= TICKET_MINIMO] if TICKET_MINIMO > 0 else vals
+    ticket = arred(safe_div(sum(elegiveis), len(elegiveis))) if elegiveis else 0.0
+    return ticket, len(elegiveis), len(vals)
+
+
+def ticket_de_deals(deals):
+    """Atalho: o ticket a partir da lista de negócios, lendo o valor bruto de cada um."""
+    return ticket_de([d.get("value") for d in deals])
+
+
+def ticket_payload(valores):
+    """As três chaves que o front espera, para não repetir o mesmo dict em 8 lugares."""
+    t, q, tot = ticket_de(valores)
+    return {"ticket": t, "ticket_qtd": q, "ticket_base": tot, "ticket_min": TICKET_MINIMO}
 
 
 def hoje_br():
@@ -743,7 +785,9 @@ def calcular_sdrs(mes, ano, metas, ganhos, users, du_total, du_pass):
             "valor_ganho": arred(valor_bruto),
             "valor_ganho_multi": arred(valor_multi),
             "pct_ganhos": pct_ganhos,
-            "ticket_medio": arred(safe_div(valor_bruto, len(deals_sdr))) if deals_sdr else 0.0,
+            "ticket_medio": ticket_de_deals(deals_sdr)[0],
+            "ticket_qtd":   ticket_de_deals(deals_sdr)[1],
+            "ticket_base":  len(deals_sdr),
             "pct_final": pct_final,
             "pesos": f"{int(PESO_REU*100)}/{int(PESO_FIN*100)}",
         })
@@ -1635,7 +1679,11 @@ def calcular_navigator(mes=None, ano=None):
         "entrou_hoje_multi":  arred(g_hoje["multi"]),
         "entrou_hoje_bruto":  arred(g_hoje["bruto"]),
         "qtd_ganhos_mes":     len(ganhos),
-        "ticket_medio":       arred(safe_div(real_bruto, len(ganhos))) if ganhos else 0.0,
+        # ticket com piso: ver TICKET_MINIMO. qtd/base dizem sobre quantas vendas saiu
+        "ticket_medio":       ticket_de_deals(ganhos)[0],
+        "ticket_qtd":         ticket_de_deals(ganhos)[1],
+        "ticket_base":        len(ganhos),
+        "ticket_min":         TICKET_MINIMO,
 
         # ── recorte da equipe (só quem está em CLOSERS) ───────
         "real_bruto_equipe":         arred(real_bruto_equipe),
@@ -1650,7 +1698,9 @@ def calcular_navigator(mes=None, ano=None):
         "entrou_hoje_multi_equipe":  arred(g_hoje_equipe["multi"]),
         "entrou_hoje_bruto_equipe":  arred(g_hoje_equipe["bruto"]),
         "qtd_ganhos_mes_equipe":     len(ganhos_equipe),
-        "ticket_medio_equipe":       arred(safe_div(real_bruto_equipe, len(ganhos_equipe))) if ganhos_equipe else 0.0,
+        "ticket_medio_equipe":       ticket_de_deals(ganhos_equipe)[0],
+        "ticket_qtd_equipe":         ticket_de_deals(ganhos_equipe)[1],
+        "ticket_base_equipe":        len(ganhos_equipe),
     }
 
     # Venda com o Multiplicador em branco entra como R$ 0 contra a meta. Fica aqui
@@ -1754,10 +1804,11 @@ def calcular_navigator(mes=None, ano=None):
         nome = owner_name(d, users) or "— sem dono —"
         acc = por_closer.setdefault(nome, {
             "nome": nome, "bruto": 0.0, "multi": 0.0, "qtd": 0,
-            "aberto_hoje": 0.0, "previsto_hoje": 0.0})
+            "aberto_hoje": 0.0, "previsto_hoje": 0.0, "valores": []})
         acc["bruto"] += float(d.get("value") or 0)
         acc["multi"] += float(cf(d, CF_MULTIPLICADOR) or 0)
         acc["qtd"] += 1
+        acc["valores"].append(float(d.get("value") or 0))   # para o ticket com piso
 
     for d in abertos:
         if str(d.get("expected_close_date") or "")[:10] != hoje_str:
@@ -1765,7 +1816,7 @@ def calcular_navigator(mes=None, ano=None):
         nome = owner_name(d, users) or "— sem dono —"
         acc = por_closer.setdefault(nome, {
             "nome": nome, "bruto": 0.0, "multi": 0.0, "qtd": 0,
-            "aberto_hoje": 0.0, "previsto_hoje": 0.0})
+            "aberto_hoje": 0.0, "previsto_hoje": 0.0, "valores": []})
         v = float(d.get("value") or 0)
         pr = d.get("probability")
         acc["aberto_hoje"] += v
@@ -1798,7 +1849,7 @@ def calcular_navigator(mes=None, ano=None):
         if norm(nome_exib) not in {norm(k) for k in por_closer}:
             por_closer.setdefault(nome_exib, {
                 "nome": nome_exib, "bruto": 0.0, "multi": 0.0, "qtd": 0,
-                "aberto_hoje": 0.0, "previsto_hoje": 0.0})
+                "aberto_hoje": 0.0, "previsto_hoje": 0.0, "valores": []})
 
     closers = []
     for nome, v in por_closer.items():
@@ -1810,7 +1861,9 @@ def calcular_navigator(mes=None, ano=None):
             "real_multi": arred(v["multi"]),
             "pct": arred(safe_div(v["multi"], meta_ind) * 100) if meta_ind else None,
             "qtd": v["qtd"],
-            "ticket": arred(safe_div(v["bruto"], v["qtd"])) if v["qtd"] else 0.0,
+            "ticket": ticket_de(v["valores"])[0],
+            "ticket_qtd": ticket_de(v["valores"])[1],
+            "ticket_base": v["qtd"],
             "aberto_hoje": arred(v["aberto_hoje"]),
             "previsto_hoje": arred(v["previsto_hoje"]),
             "origem_meta": origem_meta.get(norm(nome)),
@@ -2206,12 +2259,17 @@ def calcular_resumo(mes=None, ano=None):
             "gap": arred(gap),
             "meta_dia_rest": arred(safe_div(gap, du_rest)) if du_rest and meta else 0.0,
             "qtd": len(g),
-            "ticket": arred(safe_div(bruto, len(g))) if g else 0.0,
+            "ticket": ticket_de_deals(g)[0],
+            "ticket_qtd": ticket_de_deals(g)[1],
+            "ticket_base": len(g),
             "pipe_aberto": arred(em_aberto_total),
             "previsto_hoje": b["previsto"],
             "em_aberto_hoje": b["em_aberto"],
             "qtd_abertos": len(a),
         })
+
+    todos_ganhos = [d for k in ("navigator", "mgm", "renovacao")
+                    for d in grupos[k]["ganhos"]]
 
     def soma(campo):
         return arred(sum(f[campo] or 0 for f in frentes))
@@ -2229,7 +2287,11 @@ def calcular_resumo(mes=None, ano=None):
         "gap": arred(total_meta - total_multi),
         "meta_dia_rest": arred(safe_div(total_meta - total_multi, du_rest)) if du_rest and total_meta else 0.0,
         "qtd": sum(f["qtd"] for f in frentes),
-        "ticket": arred(safe_div(soma("real_bruto"), sum(f["qtd"] for f in frentes))) if sum(f["qtd"] for f in frentes) else 0.0,
+        # o TOTAL refaz a conta sobre TODOS os negócios das três frentes — somar os
+        # tickets das frentes daria média de médias, que não é o ticket do conjunto
+        "ticket": ticket_de_deals(todos_ganhos)[0],
+        "ticket_qtd": ticket_de_deals(todos_ganhos)[1],
+        "ticket_base": len(todos_ganhos),
         "pipe_aberto": soma("pipe_aberto"),
         "previsto_hoje": soma("previsto_hoje"),
         "em_aberto_hoje": soma("em_aberto_hoje"),
@@ -2439,7 +2501,9 @@ def calcular_graficos(mes=None, ano=None):
     for k in chaves:
         linhas = [{"produto": p_, "valor": arred(v["valor"]), "multi": arred(v["multi"]),
                    "volume": v["qtd"],
-                   "ticket": arred(safe_div(v["valor"], v["qtd"])) if v["qtd"] else 0.0,
+                   "ticket": ticket_de(i["bruto"] for i in v["itens"])[0],
+                   "ticket_qtd": ticket_de(i["bruto"] for i in v["itens"])[1],
+                   "ticket_base": v["qtd"],
                    # maior primeiro: o hover serve para achar o fora da curva
                    "itens": sorted(v["itens"], key=lambda x: -x["bruto"]),
                    # o ticket médio esconde dispersão; isto diz se o preço variou
@@ -2450,13 +2514,18 @@ def calcular_graficos(mes=None, ano=None):
         linhas.sort(key=lambda x: -x["valor"])
         tot_v = sum(l["valor"] for l in linhas)
         tot_q = sum(l["volume"] for l in linhas)
+        # o TOTAL conta negócio a negócio, não média das linhas
+        todos_v = [i["bruto"] for l in linhas for i in l["itens"]]
         tabelas_produto[k] = {
             "nome": NOMES_FRENTES[k],
             "linhas": linhas,
             "total_valor": arred(tot_v),
             "total_multi": arred(sum(l["multi"] for l in linhas)),
             "total_volume": tot_q,
-            "ticket_geral": arred(safe_div(tot_v, tot_q)) if tot_q else 0.0,
+            "ticket_geral": ticket_de(todos_v)[0],
+            "ticket_geral_qtd": ticket_de(todos_v)[1],
+            "ticket_geral_base": tot_q,
+            "ticket_min": TICKET_MINIMO,
         }
 
     # ── perdidos do mês: série diária + motivos por frente ────
@@ -3110,6 +3179,11 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .kcard.forte{border-left-width:4px}
   .kcard .val.pos{color:var(--green)}
   .kcard .val.neg{color:var(--red)}
+  /* "23/77" ao lado do ticket: sobre quantas vendas a conta foi feita */
+  .tk-base{display:inline-block;margin-left:5px;padding:0 4px;border-radius:3px;
+           background:#F2F3F7;border:1px solid #D3D6E0;color:var(--muted);
+           font-size:9px;font-weight:700;cursor:help;vertical-align:middle}
+
   /* hover das linhas de produto: flutuante, sóbrio, sem roubar o clique */
   .linha-prod{cursor:default}
   .linha-prod:hover td{background:#F4F6FB}
@@ -3394,6 +3468,26 @@ function money(v, opts={}){
   return R(n);
 }
 
+// ── TICKET MÉDIO COM PISO ─────────────────────────────────────
+// O ticket só conta vendas a partir de TICKET_MINIMO (R$ 5.000 por padrão), porque
+// reserva de R$ 497, parcela "1/2" e negócio zerado derrubavam o número. Mas aí o
+// ticket passa a sair de MENOS vendas do que o volume ao lado dele — mostrar
+// "77 vendas · ticket R$ 10.338" sem dizer que o ticket saiu de 23 é mentira por
+// omissão. Então todo ticket vem acompanhado de quantas vendas entraram na conta.
+let TICKET_MIN = 5000;
+
+function tkNota(qtd, base){
+  if (qtd == null || base == null || qtd === base) return '';
+  return `<span class="tk-base" title="o ticket considera só as ${N(qtd)} venda(s) de ${
+    R(TICKET_MIN)} para cima; as outras ${N(base - qtd)} continuam no volume e na soma"
+    >${N(qtd)}/${N(base)}</span>`;
+}
+
+// para célula de tabela
+function tkCel(v, qtd, base){ return money(v) + tkNota(qtd, base); }
+// para texto corrido
+function tkTxt(v, qtd, base){ return R(v) + tkNota(qtd, base); }
+
 // ── seletores de período ──────────────────────────────────────
 (function initSelects(){
   const hoje = new Date();
@@ -3417,6 +3511,7 @@ function linha(rotulo, valorHtml, cls='', hint=''){
 function render(d){
   dadosPainel = d;
   const p = d.periodo, m = d.metricas;
+  if (m && m.ticket_min != null) TICKET_MIN = m.ticket_min;
 
   document.getElementById('periodo-badge').innerHTML =
     `${MESES[p.mes-1]} ${p.ano} &nbsp;·&nbsp; <strong>${p.du_passados}</strong>/${p.du_total} dias úteis
@@ -3494,7 +3589,8 @@ function render(d){
          soEq(m.entrou_hoje_multi_equipe !== m.entrou_hoje_multi ? R(m.entrou_hoje_multi_equipe) : ''),
          detG('hoje')) +
     card('forte', 'Total do mês', R(m.real_multi),
-         `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${R(m.ticket_medio)}` +
+         `bruto ${R(m.real_bruto)} · ${N(m.qtd_ganhos_mes)} venda(s) · ticket ${
+           tkTxt(m.ticket_medio, m.ticket_qtd, m.ticket_base)}` +
          soEq(m.real_multi_equipe !== m.real_multi
               ? `${R(m.real_multi_equipe)} · ${N(m.qtd_ganhos_mes_equipe)} venda(s)` : ''),
          detG('mes')) +
@@ -3651,11 +3747,13 @@ function render(d){
                         : `<span class="pos">${R(Math.abs(f.gap))}</span>`}</td>
         <td>${f.meta_dia_rest > 0 ? R(f.meta_dia_rest) : '<span class="zero">—</span>'}</td>
         <td>${N(f.qtd)}</td>
-        <td>${money(f.ticket)}</td>
+        <td>${tkCel(f.ticket, f.ticket_qtd, f.ticket_base)}</td>
         <td>${money(f.pipe_aberto)}</td>
       </tr>`;
     frentesHtml = `
-      <div class="block-title">Por frente<div class="rule"></div></div>
+      <div class="block-title">Por frente<div class="rule"></div>
+        <span class="peso-nota">ticket = média das vendas ≥ ${R(TICKET_MIN)}${
+          ''} · o <b>n/n</b> ao lado diz quantas entraram na conta</span></div>
       <div class="card">
         <div class="table-scroll">
           <table class="frentes">
@@ -3681,15 +3779,19 @@ function render(d){
         <td>${money(c.real_multi)}</td>
         <td>${pctTag(c.pct)}</td>
         <td>${N(c.qtd)}</td>
-        <td>${money(c.ticket)}</td>
+        <td>${tkCel(c.ticket, c.ticket_qtd, c.ticket_base)}</td>
         <td>${money(c.previsto_hoje)}</td>
         <td>${money(c.aberto_hoje)}</td>
       </tr>`).join('');
 
     const t = d.closers.reduce((a,c) => ({
       meta:a.meta+(c.meta||0), bruto:a.bruto+c.real_bruto, multi:a.multi+c.real_multi,
-      qtd:a.qtd+c.qtd, prev:a.prev+c.previsto_hoje, ab:a.ab+c.aberto_hoje
-    }), {meta:0,bruto:0,multi:0,qtd:0,prev:0,ab:0});
+      qtd:a.qtd+c.qtd, prev:a.prev+c.previsto_hoje, ab:a.ab+c.aberto_hoje,
+      // o ticket do TOTAL não pode ser bruto÷qtd: isso ignora o piso e dá um número
+      // diferente do que está nas linhas acima. Só o backend sabe quais vendas
+      // entraram no ticket, então o total também vem de lá.
+      tkQtd:a.tkQtd+(c.ticket_qtd||0), tkBase:a.tkBase+(c.ticket_base||0)
+    }), {meta:0,bruto:0,multi:0,qtd:0,prev:0,ab:0,tkQtd:0,tkBase:0});
 
     const eq = d.equipe || {};
     const notaEquipe = (eq.fora || []).length ? `
@@ -3702,7 +3804,8 @@ function render(d){
 
     closersHtml = `
     <div class="block-title">Por Closer<div class="rule"></div>
-      <span class="peso-nota">meta individual = comissionamento · não soma na meta da equipe</span></div>
+      <span class="peso-nota">meta individual = comissionamento · não soma na meta da equipe ·
+        ticket = média das vendas ≥ ${R(TICKET_MIN)}</span></div>
     ${notaEquipe}
     <div class="card">
       <div class="table-scroll">
@@ -3721,7 +3824,7 @@ function render(d){
               <td>${R(t.multi)}</td>
               <td>${pctTag(m.meta_mes > 0 ? t.multi/m.meta_mes*100 : null)}</td>
               <td>${N(t.qtd)}</td>
-              <td>${R(t.qtd ? t.bruto/t.qtd : 0)}</td>
+              <td>${tkCel(m.ticket_medio, m.ticket_qtd, m.ticket_base)}</td>
               <td>${R(t.prev)}</td>
               <td>${R(t.ab)}</td>
             </tr>
@@ -3962,7 +4065,8 @@ function verGanho(qual){
                : (() => true);
   const rot = qual === 'hoje'  ? `Hoje · ${fmtDia(p.hoje)}`
             : qual === 'ontem' ? `Último dia útil · ${fmtDia(p.ontem)}`
-            : `Total do mês · ticket médio ${R(m.ticket_medio)}`;
+            : `Total do mês · ticket médio ${R(m.ticket_medio)}${
+                m.ticket_qtd !== m.ticket_base ? ` (${N(m.ticket_qtd)} de ${N(m.ticket_base)} venda(s))` : ''}`;
   const itens = g.filter(filtro);
   abreDet('det-ganho', qual, `Ganho — ${rot} · ${N(itens.length)} venda(s)`,
     tabelaGanhos(itens, 'Nenhuma venda fechada nesse período.'),
@@ -4525,7 +4629,8 @@ function tipProduto(ev, frente, idx){
       l.volume <= 1 ? 'Venda única.'
       : l.preco_unico
         ? `Todas as ${N(l.volume)} saíram por <b>${R(l.bruto_max)}</b>.`
-        : `Preço <b>varia</b>: de ${R(l.bruto_min)} a ${R(l.bruto_max)} · ticket médio ${R(l.ticket)}.`}${
+        : `Preço <b>varia</b>: de ${R(l.bruto_min)} a ${R(l.bruto_max)} · ticket médio ${R(l.ticket)}${
+            l.ticket_qtd !== l.ticket_base ? ` (de ${N(l.ticket_qtd)} venda(s) ≥ ${R(TICKET_MIN)})` : ''}.`}${
       itens.some(i => i.sem_multi) ? ' <span class="tp-flag">⚠</span> = sem multiplicador.' : ''}</div>`;
   el.hidden = false;
   moveTip(ev);
@@ -4534,6 +4639,8 @@ function tipProduto(ev, frente, idx){
 function renderGraficos(d){
   destroiCharts();
   dadosGraficos = d;
+  const tmin = ((d.produtos || {}).navigator || {}).ticket_min;
+  if (tmin != null) TICKET_MIN = tmin;
   escondeTip();
   const fr = d.frentes;
   const alertas = (d.alertas || []).map(a => `<div class="alerta">⚠ ${esc(a)}</div>`).join('');
@@ -4574,13 +4681,13 @@ function renderGraficos(d){
                 ? '<span class="pt-varia" title="as vendas saíram por preços diferentes">~</span>' : ''}</td>
             <td class="num">${R(l.valor)}</td>
             <td class="num">${N(l.volume)}</td>
-            <td class="num">${R(l.ticket)}</td>
+            <td class="num">${tkCel(l.ticket, l.ticket_qtd, l.ticket_base)}</td>
           </tr>`).join('') +
         `<tr class="total">
             <td class="mot">TOTAL</td>
             <td class="num">${R(t.total_valor)}</td>
             <td class="num">${N(t.total_volume)}</td>
-            <td class="num">${R(t.ticket_geral)}</td>
+            <td class="num">${tkCel(t.ticket_geral, t.ticket_geral_qtd, t.ticket_geral_base)}</td>
          </tr>`
       : `<tr><td colspan="4" class="perda-vazio">Nenhuma venda nesta frente no mês.</td></tr>`;
     return `
@@ -4597,7 +4704,7 @@ function renderGraficos(d){
   };
   const tabelasProduto = `
     <div class="block-title">Produtos vendidos por frente<div class="rule"></div>
-      <span class="peso-nota">valor bruto · ticket = valor ÷ volume ·
+      <span class="peso-nota">valor bruto · ticket = média das vendas ≥ ${R(TICKET_MIN)} ·
         passe o mouse na linha para ver as vendas uma a uma · <b>~</b> = preço variou</span>
     </div>
     <div class="perda-grid">${fr.map(f => tabelaProduto(f.chave)).join('')}</div>`;
