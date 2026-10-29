@@ -1110,6 +1110,17 @@ def produtos_do_deal(deal):
 # casado por "contém" no nome da etapa (sem acento, sem case).
 ETAPA_PREVISAO = os.environ.get("ETAPA_PREVISAO", "Negocia,Inscrição em Andamento")
 
+# ── Metas de VOLUME (só no card de Atingimento, aba Gráficos) ─
+# Visão extra, pedida em out/26. NÃO entram em meta financeira, atingimento do
+# painel, gap, meta do dia nem em nada do Painel do Mês — são só dois cards.
+#   · Renovação: 40 vendas no mês (o card dela mantém o % financeiro do lado)
+#   · Coautoria: 25 vendas no mês, contando todo produto com "Coautoria" no nome
+META_VOL_RENOVACAO = int(os.environ.get("META_VOL_RENOVACAO", "40") or 0)
+META_VOL_COAUTORIA = int(os.environ.get("META_VOL_COAUTORIA", "25") or 0)
+# Casado por "contém", sem acento e sem caixa — pega "BOARD PRO COAUTORIA +
+# LINKEDIN PROGRAM" e "COAUTORIA + BOARD CLUB SELECT" também.
+PRODUTO_COAUTORIA = os.environ.get("PRODUTO_COAUTORIA", "Coautoria")
+
 # Metas por frente e por mês.
 # Set/26 revisado para 500k: os 40k a mais entraram no Navigator (300k -> 340k),
 # batendo com a meta da Denise na planilha METAS.
@@ -2676,8 +2687,50 @@ def calcular_graficos(mes=None, ano=None):
             "reunioes": sum(reunioes[k].values()),
             "deals_com_reuniao": len(com_reu[k]),
             "deals_ganhos": len(ganhou[k]),
+            # meta de VOLUME — hoje só a Renovação tem. Vem ao lado do % financeiro,
+            # não no lugar dele: a frente é cobrada nas duas réguas.
+            "meta_volume": META_VOL_RENOVACAO if k == "renovacao" else 0,
+            "pct_volume": (arred(safe_div(len(deals_f), META_VOL_RENOVACAO) * 100)
+                           if (k == "renovacao" and META_VOL_RENOVACAO) else None),
             "conversao": (arred(safe_div(len(ganhou[k]), len(com_reu[k])) * 100)
                           if com_reu[k] else None),
+        })
+
+    # ── meta de volume de Coautoria (card extra, só visão) ────
+    # Corta por NOME DO PRODUTO, não por frente: Coautoria é vendida dentro do
+    # Navigator e do MGM, e combinada com outros produtos ("COAUTORIA + BOARD
+    # CLUB SELECT"). O "contém" pega todas essas combinações.
+    metas_volume = []
+    if META_VOL_COAUTORIA:
+        termo = norm(PRODUTO_COAUTORIA)
+        deals_co = [d for d in ganhos_nav + ganhos_mgm
+                    if any(termo in norm(n) for n in produtos_do_deal(d))]
+        # reserva de Coautoria conta no volume (é o que "contém no nome" quer dizer),
+        # mas fica avisado: é compromisso, não venda cheia.
+        reservas = [d for d in deals_co if eh_reserva(d)]
+        por_produto = {}
+        for d in deals_co:
+            por_produto[produto_do_deal(d)] = por_produto.get(produto_do_deal(d), 0) + 1
+        metas_volume.append({
+            "chave": "coautoria",
+            "nome": f"Meta de {PRODUTO_COAUTORIA}",
+            "meta": META_VOL_COAUTORIA,
+            "volume": len(deals_co),
+            "pct": arred(safe_div(len(deals_co), META_VOL_COAUTORIA) * 100),
+            "falta": max(META_VOL_COAUTORIA - len(deals_co), 0),
+            "bruto": arred(sum(float(d.get("value") or 0) for d in deals_co)),
+            "reservas": len(reservas),
+            "regra": f'produto contém "{PRODUTO_COAUTORIA}"',
+            "produtos": dict(sorted(por_produto.items(), key=lambda kv: -kv[1])[:8]),
+            "itens": sorted(({
+                "id": d.get("id"),
+                "titulo": d.get("title") or "(sem título)",
+                "dono": owner_name(d, users) or "— sem dono —",
+                "produto": produto_do_deal(d),
+                "bruto": arred(float(d.get("value") or 0)),
+                "dia": won_time_br(d)[:10],
+                "reserva": eh_reserva(d),
+            } for d in deals_co), key=lambda x: (x["dia"] or "", -x["bruto"])),
         })
 
     alertas = []
@@ -2713,6 +2766,7 @@ def calcular_graficos(mes=None, ano=None):
         "filtro_perdidos": FILTER_PERDIDOS,
         "jacare": jacare,
         "atingimento": atingimento,
+        "metas_volume": metas_volume,
         "alertas": alertas,
     }
 
@@ -3284,6 +3338,21 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .tip-prod .tp-pe{padding:7px 11px;font-size:10px;color:var(--muted);
                    border-top:1px solid var(--border);background:#FAFBFD;white-space:normal}
   .tip-prod .tp-pe b{color:var(--navy)}
+
+  /* meta de volume: segunda régua dentro do card, sem competir com o número grande */
+  .meta-vol{margin-top:8px;padding-top:7px;border-top:1px dashed var(--border);
+            display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
+  .meta-vol .mv-rot{font-size:9px;font-weight:700;color:var(--muted);
+                    text-transform:uppercase;letter-spacing:.5px}
+  .meta-vol .mv-val{font-size:15px;font-weight:800;color:var(--navy)}
+  .meta-vol .mv-val.pos{color:var(--green)}
+  .meta-vol .mv-sub{font-size:10px;color:var(--muted)}
+  .kcard.kvol{border-left-color:#7A8CA8;background:#FBFCFE}
+  .kcard.kvol .hint-vol{margin-left:6px;padding:1px 5px;border-radius:3px;background:#EEF1F6;
+                        border:1px solid #D3D6E0;color:var(--muted);font-size:8px;
+                        letter-spacing:.4px}
+  .mv-prods{margin-top:4px;font-size:10px;color:var(--muted);text-decoration:underline dotted;
+            cursor:help;display:block;width:fit-content}
 
   /* alertinha de dado faltando: avisa sem virar carnaval */
   .aviso-multi{margin-top:6px;padding:4px 8px;border-radius:4px;background:var(--amber-bg);
@@ -4737,11 +4806,34 @@ function renderGraficos(d){
         difere ? ` <span class="hint">· bruto ${R(a.bruto)}</span>` : ''}<br>
         ${N(a.vendas)} venda(s) · ${N(a.reunioes)} reunião(ões) validada(s)<br>
         conversão ${P(a.conversao)} <span class="hint">${N(a.deals_ganhos)} de ${N(a.deals_com_reuniao)} negócio(s)</span>${
+        a.meta_volume ? `<div class="meta-vol">
+            <span class="mv-rot">meta de volume</span>
+            <span class="mv-val ${a.pct_volume >= 100 ? 'pos' : ''}">${P(a.pct_volume)}</span>
+            <span class="mv-sub">${N(a.vendas)} de ${N(a.meta_volume)} venda(s)${
+              a.vendas < a.meta_volume ? ` · faltam ${N(a.meta_volume - a.vendas)}` : ''}</span>
+          </div>` : ''}${
         sm.qtd ? `<div class="aviso-multi" title="${esc((sm.itens || [])
             .map(i => `${i.titulo} — ${R(i.valor)}`).join(' · '))}">⚠ ${N(sm.qtd)} venda(s)
             sem multiplicador · ${R(sm.bruto)} fora da conta</div>` : ''}</div>
     </div>`;
   }).join('');
+
+  // ── metas de VOLUME avulsas (hoje: Coautoria) ──
+  // Card de visão, fora da régua de frente: não tem meta financeira, não entra no
+  // atingimento do painel. Só responde "quantas Coautorias saíram este mês".
+  const cardsVol = (d.metas_volume || []).map(v => `
+    <div class="kcard kvol">
+      <div class="rot">${esc(v.nome)}<span class="hint-vol">volume</span></div>
+      <div class="val ${v.pct >= 100 ? 'pos' : ''}">${P(v.pct)}</div>
+      <div class="sub"><b>${N(v.volume)}</b> de ${N(v.meta)} venda(s)${
+        v.falta ? ` · faltam <b>${N(v.falta)}</b>` : ' · <span class="pos">meta batida</span>'}<br>
+        ${R(v.bruto)} em bruto · ${esc(v.regra)}${
+        v.reservas ? `<br><span class="hint">inclui ${N(v.reservas)} reserva(s)</span>` : ''}${
+        Object.keys(v.produtos || {}).length > 1
+          ? `<div class="mv-prods" title="${esc(Object.entries(v.produtos)
+              .map(([p, q]) => `${p} (${q})`).join(' · '))}">${
+              Object.keys(v.produtos).length} produto(s) diferentes</div>` : ''}</div>
+    </div>`).join('');
 
   const cm = d.conversao_mes || {};
 
@@ -4833,7 +4925,7 @@ function renderGraficos(d){
 
   document.getElementById('conteudo-graficos').innerHTML = `
     <div class="block-title">Atingimento por frente<div class="rule"></div></div>
-    <div class="cards">${cardsAting}</div>
+    <div class="cards">${cardsAting}${cardsVol}</div>
     <div class="nota-comp">Conversão consolidada: <b>${P(cm.taxa)}</b> —
       ${N(cm.deals_ganhos || 0)} negócio(s) Ganho de ${N(cm.deals_com_reuniao || 0)} com reunião validada no mês.</div>
 
