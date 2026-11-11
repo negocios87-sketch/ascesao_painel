@@ -1121,6 +1121,40 @@ META_VOL_COAUTORIA = int(os.environ.get("META_VOL_COAUTORIA", "25") or 0)
 # LINKEDIN PROGRAM" e "COAUTORIA + BOARD CLUB SELECT" também.
 PRODUTO_COAUTORIA = os.environ.get("PRODUTO_COAUTORIA", "Coautoria")
 
+# ── Meta de GESTORA (card próprio na aba Gráficos) ────────────
+# A Mylena tem duas metas que não se somam: a dela dentro dos 642k da equipe
+# (vendas próprias) e esta, de gestora, que mede o faturamento que ela INFLUENCIA
+# — inclusive venda fechada por outra pessoa. Por isso vive num card separado e
+# não entra em frente, atingimento, gap nem meta do dia.
+#
+# Cada componente é um recorte dos ganhos do mês por DONO e/ou QUALIFICADOR:
+#   dono       -> quem fechou (owner do negócio no Pipedrive)
+#   qualificou -> campo personalizado Qualificador
+#   produto    -> "contém" no nome do produto
+#   frente     -> navigator / mgm / renovacao
+META_GESTORA = {
+    "pessoa": os.environ.get("GESTORA", "Mylena Oliveira"),
+    "meta": float(os.environ.get("META_GESTORA", "500000") or 0),
+    "componentes": [
+        {"chave": "renovacao", "nome": "Renovações", "meta": 54500,
+         "papel": "closer — via WhatsApp, sem reunião",
+         "regra": "ela é dona do negócio, na frente Renovação",
+         "dono": "@gestora", "frente": "renovacao"},
+        {"chave": "coautoria", "nome": "Coautoria", "meta": 125000,
+         "papel": "dona ou qualificadora",
+         "regra": 'produto contém "Coautoria" e ela é dona OU qualificadora',
+         "dono_ou_qualificou": "@gestora", "produto": "Coautoria"},
+        {"chave": "denise", "nome": "Vendas Denise", "meta": 60500,
+         "papel": "Denise fecha, Mylena qualifica",
+         "regra": "Denise é dona do negócio e ela é a qualificadora",
+         "dono": "Denise Mussolin", "qualificou": "@gestora"},
+        {"chave": "raphaela", "nome": "Raphaela SDR", "meta": 265000,
+         "papel": "gestora — supervisiona prospecção e agendamento",
+         "regra": "Raphaela é a qualificadora do negócio",
+         "qualificou": "Raphaela Moutinho"},
+    ],
+}
+
 # Metas por frente e por mês.
 # Set/26 revisado para 500k: os 40k a mais entraram no Navigator (300k -> 340k),
 # batendo com a meta da Denise na planilha METAS.
@@ -2432,6 +2466,111 @@ def calcular_resumo(mes=None, ano=None):
 
 
 # ── ABA GRÁFICOS ──────────────────────────────────────────────
+def nome_qualificador(deal, labels=None):
+    """
+    Nome de quem QUALIFICOU o negócio, como está escrito no Pipedrive.
+
+    Usa opcoes_do_campo (id -> label original). Inverter buscar_qual_ids() não serve:
+    aquele mapa guarda o nome já normalizado, e a tela mostraria "mylena oliveira".
+    """
+    v = cf(deal, CF_QUALIFICADOR)
+    if v is None:
+        return ""
+    if isinstance(v, dict):
+        return str(v.get("label") or "").strip()
+    mapa = labels if labels is not None else opcoes_do_campo(CF_QUALIFICADOR)
+    return mapa.get(str(v), "")
+
+
+def calcular_meta_gestora(ganhos, users, frente_por_deal):
+    """
+    A meta de gestora: faturamento que a pessoa INFLUENCIA, não só o que ela fecha.
+
+    Cada negócio entra em UM componente só, no primeiro que casar, na ordem em que
+    estão configurados. Sem isso o total estoura: uma Coautoria fechada pela Denise
+    com a Mylena qualificando casaria em dois componentes e seria contada duas vezes.
+    A ordem vai do mais específico (dona + frente) para o mais largo (qualificadora).
+    """
+    cfg = META_GESTORA
+    pessoa = cfg.get("pessoa") or ""
+    if not pessoa or not cfg.get("meta"):
+        return None
+
+    inv = opcoes_do_campo(CF_QUALIFICADOR)      # id -> label como está no CRM
+
+    def resolve(valor):
+        return pessoa if valor == "@gestora" else valor
+
+    def casa(d, comp):
+        dono = norm(owner_name(d, users))
+        qual = norm(nome_qualificador(d, inv))
+        if comp.get("dono") and dono != norm(resolve(comp["dono"])):
+            return False
+        if comp.get("qualificou") and qual != norm(resolve(comp["qualificou"])):
+            return False
+        if comp.get("dono_ou_qualificou"):
+            alvo = norm(resolve(comp["dono_ou_qualificou"]))
+            if dono != alvo and qual != alvo:
+                return False
+        if comp.get("frente") and frente_por_deal.get(d.get("id")) != comp["frente"]:
+            return False
+        if comp.get("produto"):
+            termo = norm(comp["produto"])
+            if not any(termo in norm(n) for n in produtos_do_deal(d)):
+                return False
+        return True
+
+    baldes = {c["chave"]: [] for c in cfg["componentes"]}
+    multi_casa = 0          # quantos casariam em mais de um componente
+    for d in ganhos:
+        casou = [c["chave"] for c in cfg["componentes"] if casa(d, c)]
+        if not casou:
+            continue
+        if len(casou) > 1:
+            multi_casa += 1
+        baldes[casou[0]].append(d)          # o primeiro da ordem leva
+
+    linhas, tot_bruto, tot_multi, tot_meta, tot_qtd = [], 0.0, 0.0, 0.0, 0
+    for c in cfg["componentes"]:
+        g = baldes[c["chave"]]
+        bruto = sum(float(d.get("value") or 0) for d in g)
+        multi = sum(float(cf(d, CF_MULTIPLICADOR) or 0) for d in g)
+        meta_c = float(c.get("meta") or 0)
+        tot_bruto += bruto; tot_multi += multi; tot_meta += meta_c; tot_qtd += len(g)
+        linhas.append({
+            "chave": c["chave"], "nome": c["nome"], "papel": c.get("papel", ""),
+            "regra": c.get("regra", ""),
+            "meta": arred(meta_c), "bruto": arred(bruto), "multi": arred(multi),
+            "pct": arred(safe_div(multi, meta_c) * 100) if meta_c else None,
+            "qtd": len(g),
+            "itens": sorted(({
+                "id": d.get("id"),
+                "titulo": d.get("title") or "(sem título)",
+                "dono": owner_name(d, users) or "— sem dono —",
+                "qualificou": nome_qualificador(d, inv) or "—",
+                "produto": produto_do_deal(d),
+                "bruto": arred(float(d.get("value") or 0)),
+                "multi": arred(float(cf(d, CF_MULTIPLICADOR) or 0)),
+                "dia": won_time_br(d)[:10],
+            } for d in g), key=lambda x: -x["multi"]),
+        })
+
+    meta_total = float(cfg["meta"])
+    return {
+        "pessoa": pessoa,
+        "meta": arred(meta_total),
+        "multi": arred(tot_multi),
+        "bruto": arred(tot_bruto),
+        "pct": arred(safe_div(tot_multi, meta_total) * 100) if meta_total else None,
+        "qtd": tot_qtd,
+        "linhas": linhas,
+        # os componentes somam a meta total? se não, a configuração está furada
+        "soma_componentes": arred(tot_meta),
+        "bate": abs(tot_meta - meta_total) < 1,
+        "multi_casa": multi_casa,
+    }
+
+
 def calcular_graficos(mes=None, ano=None):
     """
     Séries diárias para a aba Gráficos:
@@ -2733,7 +2872,23 @@ def calcular_graficos(mes=None, ano=None):
             } for d in deals_co), key=lambda x: (x["dia"] or "", -x["bruto"])),
         })
 
+    # ── meta de gestora (card próprio) ───────────────────────
+    gestora, erro_gestora = None, None
+    try:
+        gestora = calcular_meta_gestora(ganhos_nav + ganhos_mgm, users, frente_por_deal)
+    except Exception as e:
+        erro_gestora = f"{type(e).__name__}: {e}"
+
     alertas = []
+    if erro_gestora:
+        alertas.append("Não consegui montar a meta de gestora agora — " + erro_gestora)
+    if gestora and not gestora["bate"]:
+        alertas.append(
+            f"Os componentes da meta de {gestora['pessoa']} somam "
+            + f"R$ {gestora['soma_componentes']:,.0f}".replace(",", ".")
+            + ", mas a meta dela está configurada como "
+            + f"R$ {gestora['meta']:,.0f}".replace(",", ".")
+            + " — conferir META_GESTORA.")
     if erro_mgm:
         alertas.append("Não consegui ler o funil MGM agora — " + erro_mgm)
     if erro_reu:
@@ -2767,6 +2922,7 @@ def calcular_graficos(mes=None, ano=None):
         "jacare": jacare,
         "atingimento": atingimento,
         "metas_volume": metas_volume,
+        "gestora": gestora,
         "alertas": alertas,
     }
 
@@ -3338,6 +3494,20 @@ PAGINA_HTML = r"""<!DOCTYPE html>
   .tip-prod .tp-pe{padding:7px 11px;font-size:10px;color:var(--muted);
                    border-top:1px solid var(--border);background:#FAFBFD;white-space:normal}
   .tip-prod .tp-pe b{color:var(--navy)}
+
+  /* meta de gestora: card à parte, visualmente separado das frentes */
+  .g-card{padding:0;overflow:hidden}
+  .g-topo{display:flex;gap:34px;padding:16px 18px 14px;border-bottom:1px solid var(--border);
+          background:#FBFCFE;flex-wrap:wrap}
+  .g-topo .g-rot{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.6px;
+                 text-transform:uppercase}
+  .g-topo .g-val{font-size:26px;font-weight:800;color:var(--navy);line-height:1.1;margin-top:2px;
+                 font-variant-numeric:tabular-nums}
+  .g-topo .g-val.pos{color:var(--green)}
+  .g-topo .g-sub{font-size:11px;color:var(--muted);margin-top:3px}
+  .g-tab .g-papel{font-size:10px;color:var(--muted);font-weight:400;margin-top:2px;line-height:1.35}
+  .g-tab tr.lg{cursor:default}
+  .g-tab tr.lg:hover td{background:#F4F6FB}
 
   /* meta de volume: segunda régua dentro do card, sem competir com o número grande */
   .meta-vol{margin-top:8px;padding-top:7px;border-top:1px dashed var(--border);
@@ -4783,6 +4953,93 @@ function tipProduto(ev, frente, idx){
   moveTip(ev);
 }
 
+
+// ── META DE GESTORA (card próprio, fora da régua de frente) ───
+// Mede o faturamento que a pessoa INFLUENCIA, não só o que ela fecha: entra venda
+// de outra pessoa quando ela qualificou. Por isso NÃO soma com a meta da equipe e
+// vive separado — somar as duas contaria o mesmo real duas vezes.
+function blocoGestora(g){
+  if (!g || !g.meta) return '';
+  const linhas = (g.linhas || []).map(l => `
+    <tr${l.qtd ? ` class="lg" onmouseenter="tipGestora(event,'${l.chave}')"
+         onmousemove="moveTip(event)" onmouseleave="escondeTip()"` : ''}>
+      <td class="mot"><b>${esc(l.nome)}</b>
+        <div class="g-papel">${esc(l.regra)}</div></td>
+      <td class="num">${R(l.meta)}</td>
+      <td class="num"><b>${R(l.multi)}</b></td>
+      <td class="num">${pctTag(l.pct)}</td>
+      <td class="num">${l.qtd ? N(l.qtd) : '<span class="zero">—</span>'}</td>
+    </tr>`).join('');
+  const falta = g.meta - g.multi;
+  return `
+    <div class="block-title">Meta de gestora — ${esc(g.pessoa)}<div class="rule"></div>
+      <span class="peso-nota">visão à parte · <b>não</b> soma com a meta da equipe nem
+        com as frentes · um negócio entra em um componente só</span></div>
+    <div class="card g-card">
+      <div class="g-topo">
+        <div class="g-num">
+          <div class="g-rot">Atingimento</div>
+          <div class="g-val ${g.pct >= 100 ? 'pos' : ''}">${P(g.pct)}</div>
+          <div class="g-sub">${R(g.multi)} de ${R(g.meta)}${
+            falta > 0 ? ` · faltam <b>${R(falta)}</b>` : ' · <span class="pos">meta batida</span>'}</div>
+        </div>
+        <div class="g-num">
+          <div class="g-rot">Negócios</div>
+          <div class="g-val">${N(g.qtd)}</div>
+          <div class="g-sub">bruto ${R(g.bruto)}</div>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="perda g-tab">
+          <thead><tr>
+            <th>Componente</th><th class="num">Meta</th><th class="num">Realizado</th>
+            <th class="num">%</th><th class="num">Vol.</th>
+          </tr></thead>
+          <tbody>${linhas}
+            <tr class="total">
+              <td class="mot">TOTAL</td>
+              <td class="num">${R(g.soma_componentes)}</td>
+              <td class="num">${R(g.multi)}</td>
+              <td class="num">${pctTag(g.pct)}</td>
+              <td class="num">${N(g.qtd)}</td>
+            </tr></tbody>
+        </table>
+      </div>
+      <div class="fc-nota">Realizado é o valor <b>com multiplicador</b>, mesma régua da meta.
+        Passe o mouse na linha para ver os negócios.${
+        g.multi_casa ? ` <b>${N(g.multi_casa)}</b> negócio(s) casavam em mais de um componente
+          e foram contados uma vez só, no primeiro da ordem (Renovações → Coautoria →
+          Vendas Denise → Raphaela SDR).` : ''}${
+        g.bate ? '' : ` <b class="falta">Atenção:</b> os componentes somam ${R(g.soma_componentes)},
+          e a meta configurada é ${R(g.meta)}.`}</div>
+    </div>`;
+}
+
+function tipGestora(ev, chave){
+  const g = (dadosGraficos || {}).gestora;
+  const l = g && (g.linhas || []).find(x => x.chave === chave);
+  if (!l || !(l.itens || []).length) return;
+  const MAX = 12;
+  const linhas = l.itens.slice(0, MAX).map(i => `
+    <tr>
+      <td class="tp-dia">${fmtDia(i.dia)}</td>
+      <td class="tp-tit">${esc(i.titulo)}</td>
+      <td class="tp-dono">${esc(i.dono)}</td>
+      <td class="tp-dono">${esc(i.qualificou)}</td>
+      <td class="tp-val">${R(i.multi)}</td>
+    </tr>`).join('');
+  const el = caixaTip();
+  el.innerHTML = `
+    <div class="tp-head">${esc(l.nome)}
+      <span class="tp-sub">${N(l.qtd)} negócio(s) · ${R(l.multi)} · ${esc(l.papel)}</span></div>
+    <table class="tp-tab"><thead><tr><th>Dia</th><th>Negócio</th><th>Fechou</th>
+      <th>Qualificou</th><th class="tp-val">Valor</th></tr></thead><tbody>${linhas}</tbody></table>
+    ${l.itens.length > MAX ? `<div class="tp-mais">… e mais ${N(l.itens.length - MAX)}</div>` : ''}
+    <div class="tp-pe">${esc(l.regra)}</div>`;
+  el.hidden = false;
+  moveTip(ev);
+}
+
 function renderGraficos(d){
   destroiCharts();
   dadosGraficos = d;
@@ -4928,6 +5185,7 @@ function renderGraficos(d){
     <div class="cards">${cardsAting}${cardsVol}</div>
     <div class="nota-comp">Conversão consolidada: <b>${P(cm.taxa)}</b> —
       ${N(cm.deals_ganhos || 0)} negócio(s) Ganho de ${N(cm.deals_com_reuniao || 0)} com reunião validada no mês.</div>
+    ${blocoGestora(d.gestora)}
 
     <div class="graf">
       <div class="graf-tit">Reuniões validadas por dia</div>
