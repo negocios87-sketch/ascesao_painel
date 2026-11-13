@@ -1122,10 +1122,16 @@ META_VOL_COAUTORIA = int(os.environ.get("META_VOL_COAUTORIA", "25") or 0)
 PRODUTO_COAUTORIA = os.environ.get("PRODUTO_COAUTORIA", "Coautoria")
 
 # ── Meta de GESTORA (card próprio na aba Gráficos) ────────────
-# A Mylena tem duas metas que não se somam: a dela dentro dos 642k da equipe
-# (vendas próprias) e esta, de gestora, que mede o faturamento que ela INFLUENCIA
-# — inclusive venda fechada por outra pessoa. Por isso vive num card separado e
-# não entra em frente, atingimento, gap nem meta do dia.
+# DESLIGADO (nov/26, a pedido do Rodrigo): a meta da Mylena voltou a ser só a
+# dela dentro da meta da equipe. Com meta 0 o backend devolve gestora = null e o
+# card não é renderizado — o resto do painel ignora esse bloco por completo.
+# Para religar, basta a variável de ambiente META_GESTORA=500000 na Vercel
+# (ou trocar o default abaixo de volta para "500000"). A configuração dos
+# componentes fica guardada aqui, intacta, pronta para quando/se voltar.
+#
+# O que esse card media: o faturamento que a pessoa INFLUENCIA, não só o que ela
+# fecha — inclusive venda de outra pessoa quando ela qualificou. Por isso vivia
+# num card separado e NUNCA entrou em frente, atingimento, gap nem meta do dia.
 #
 # Cada componente é um recorte dos ganhos do mês por DONO e/ou QUALIFICADOR:
 #   dono       -> quem fechou (owner do negócio no Pipedrive)
@@ -1134,7 +1140,7 @@ PRODUTO_COAUTORIA = os.environ.get("PRODUTO_COAUTORIA", "Coautoria")
 #   frente     -> navigator / mgm / renovacao
 META_GESTORA = {
     "pessoa": os.environ.get("GESTORA", "Mylena Oliveira"),
-    "meta": float(os.environ.get("META_GESTORA", "500000") or 0),
+    "meta": float(os.environ.get("META_GESTORA", "0") or 0),
     "componentes": [
         {"chave": "renovacao", "nome": "Renovações", "meta": 49500,
          "papel": "closer — via WhatsApp, sem reunião",
