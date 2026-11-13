@@ -1136,7 +1136,7 @@ META_GESTORA = {
     "pessoa": os.environ.get("GESTORA", "Mylena Oliveira"),
     "meta": float(os.environ.get("META_GESTORA", "500000") or 0),
     "componentes": [
-        {"chave": "renovacao", "nome": "Renovações", "meta": 54500,
+        {"chave": "renovacao", "nome": "Renovações", "meta": 49500,
          "papel": "closer — via WhatsApp, sem reunião",
          "regra": "ela é dona do negócio, na frente Renovação",
          "dono": "@gestora", "frente": "renovacao"},
