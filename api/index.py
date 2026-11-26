@@ -1017,14 +1017,22 @@ PRODUTO_RENOVACAO = os.environ.get("PRODUTO_RENOVACAO", "Renovação")
 
 # ── REFERIDOS (indicações) ────────────────────────────────────
 # Um negócio é referido se a Origem contém "buzzlead" OU a tag v2 traz
-# "indicacao-comercial". As duas regras são OU, não E.
+# QUALQUER UMA das tags da lista ("indicacao-comercial", "referido-comercial").
+# As regras são OU, não E. Para incluir mais uma tag, basta acrescentar na
+# lista separada por vírgula (ou na variável de ambiente TAG_REFERIDO_VALORES).
 CF_ORIGEM          = os.environ.get("CF_ORIGEM", "58cb059ade38e20702c892ee413f24e38c52d327")
 ORIGEM_REFERIDO    = os.environ.get("ORIGEM_REFERIDO", "buzzlead")
 CF_TAG_REFERIDO    = os.environ.get("CF_TAG_REFERIDO", TAG_RENOVACAO_CAMPO)
-TAG_REFERIDO_VALORES = os.environ.get(
-    "TAG_REFERIDO_VALORES",
-    "indicacao-comercial,referido-comercial"
-).split(",")
+TAG_REFERIDO_VALORES = [
+    t.strip() for t in os.environ.get(
+        "TAG_REFERIDO_VALORES",
+        os.environ.get("TAG_REFERIDO_VALOR", "indicacao-comercial,referido-comercial"),
+    ).split(",") if t.strip()
+]
+# Versão normalizada, usada na comparação com as tags do negócio
+TAGS_REFERIDO_NORM = {norm(t) for t in TAG_REFERIDO_VALORES if norm(t)}
+# Texto para exibir no painel ("indicacao-comercial, referido-comercial")
+TAG_REFERIDO_VALOR = ", ".join(TAG_REFERIDO_VALORES)
 
 # ── PRODUTO VENDIDO ───────────────────────────────────────────
 # Campo de LISTA (label limpo, sem variação de grafia). O de texto livre entra
@@ -1339,7 +1347,7 @@ def eh_referido(deal):
     """
     True se o negócio veio de indicação. Duas portas de entrada, em OU:
       · Origem contém "buzzlead"  (campo de texto, casamento por "contém")
-      · tag v2 contém "indicacao-comercial"  (casamento por item da lista)
+      · tag v2 contém alguma de TAG_REFERIDO_VALORES  (casamento por item da lista)
     """
     alvo_origem = norm(ORIGEM_REFERIDO)
     if alvo_origem and CF_ORIGEM:
@@ -1349,9 +1357,8 @@ def eh_referido(deal):
             if alvo_origem in norm(txt):
                 return True
 
-    alvo_tag = norm(TAG_REFERIDO_VALOR)
-    if alvo_tag and CF_TAG_REFERIDO:
-        if alvo_tag in tags_do_campo(deal, CF_TAG_REFERIDO):
+    if TAGS_REFERIDO_NORM and CF_TAG_REFERIDO:
+        if TAGS_REFERIDO_NORM & tags_do_campo(deal, CF_TAG_REFERIDO):
             return True
     return False
 
@@ -1365,9 +1372,8 @@ def motivo_referido(deal):
         if origem is not None:
             txt = origem.get("label", "") if isinstance(origem, dict) else origem
             por_origem = alvo_origem in norm(txt)
-    alvo_tag = norm(TAG_REFERIDO_VALOR)
-    if alvo_tag and CF_TAG_REFERIDO:
-        por_tag = alvo_tag in tags_do_campo(deal, CF_TAG_REFERIDO)
+    if TAGS_REFERIDO_NORM and CF_TAG_REFERIDO:
+        por_tag = bool(TAGS_REFERIDO_NORM & tags_do_campo(deal, CF_TAG_REFERIDO))
     return por_origem, por_tag
 
 
