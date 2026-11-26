@@ -1021,7 +1021,10 @@ PRODUTO_RENOVACAO = os.environ.get("PRODUTO_RENOVACAO", "Renovação")
 CF_ORIGEM          = os.environ.get("CF_ORIGEM", "58cb059ade38e20702c892ee413f24e38c52d327")
 ORIGEM_REFERIDO    = os.environ.get("ORIGEM_REFERIDO", "buzzlead")
 CF_TAG_REFERIDO    = os.environ.get("CF_TAG_REFERIDO", TAG_RENOVACAO_CAMPO)
-TAG_REFERIDO_VALOR = os.environ.get("TAG_REFERIDO_VALOR", "indicacao-comercial")
+TAG_REFERIDO_VALORES = os.environ.get(
+    "TAG_REFERIDO_VALORES",
+    "indicacao-comercial,referido-comercial"
+).split(",")
 
 # ── PRODUTO VENDIDO ───────────────────────────────────────────
 # Campo de LISTA (label limpo, sem variação de grafia). O de texto livre entra
